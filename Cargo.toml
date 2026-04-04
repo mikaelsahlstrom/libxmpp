@@ -1,0 +1,25 @@
+[package]
+name = "libxmpp"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "xmpp"
+path = "src/lib.rs"
+create-type = "lib"
+
+[dependencies]
+tokio = { version = "1.51.0", features = ["full"] }
+tokio-rustls = "0.26.4"
+webpki-roots = "1.0.6"
+log = "0.4.29"
+quick-xml = { version = "0.37", features = ["serialize"] }
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
+hmac = "0.12"
+sha1 = "0.10"
+pbkdf2 = "0.12"
+rand = "0.8"
+
+[dev-dependencies]
+env_logger = "0.11.10"
