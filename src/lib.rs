@@ -57,7 +57,7 @@ impl XmppClient
 
         let task = tokio::spawn(async move
         {
-            let mut framer = XmlFramer::new();
+            let mut framer = XmlFramer::new_opened();
             let mut pending_joins: HashMap<String, Vec<RoomMember>> = HashMap::new();
             let mut joined_rooms: HashSet<String> = HashSet::new();
 

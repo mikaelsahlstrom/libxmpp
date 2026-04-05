@@ -73,11 +73,15 @@ impl Tcp
         {
             Self::Connected(stream, _) =>
             {
-                return stream.write_all(data).await.map_err(|e| e.to_string());
+                stream.write_all(data).await.map_err(|e| e.to_string())?;
+                stream.flush().await.map_err(|e| e.to_string())?;
+                return Ok(());
             }
             Self::ConnectedTls(stream) =>
             {
-                return stream.write_all(data).await.map_err(|e| e.to_string());
+                stream.write_all(data).await.map_err(|e| e.to_string())?;
+                stream.flush().await.map_err(|e| e.to_string())?;
+                return Ok(());
             }
             Self::Disconnected => return Err("Not connected".to_string()),
         }
@@ -165,10 +169,12 @@ impl TcpWriter
             Self::Plain(writer) =>
             {
                 writer.write_all(data).await.map_err(|e| e.to_string())?;
+                writer.flush().await.map_err(|e| e.to_string())?;
             }
             Self::Tls(writer) =>
             {
                 writer.write_all(data).await.map_err(|e| e.to_string())?;
+                writer.flush().await.map_err(|e| e.to_string())?;
             }
         }
 

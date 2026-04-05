@@ -1,53 +1,68 @@
 use base64::{ Engine, engine::general_purpose::STANDARD as BASE64 };
-use hmac::{ Hmac, Mac };
+use hmac::{ Hmac, Mac, EagerHash };
 use hmac::digest::KeyInit;
-use sha1::{ Sha1, Digest };
+use sha1::Sha1;
+use sha2::{ Sha256, Sha512 };
 use quick_xml::Reader;
 use quick_xml::events::Event;
+use std::marker::PhantomData;
 
-type HmacSha1 = Hmac<Sha1>;
-
-fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20]
+fn hmac_compute<D>(key: &[u8], data: &[u8]) -> Vec<u8>
+where
+    D: EagerHash,
 {
-    let mut mac = HmacSha1::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac = Hmac::<D>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
 
-    return mac.finalize().into_bytes().into();
+    return mac.finalize().into_bytes().to_vec();
 }
 
-fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, output: &mut [u8; 20])
+fn pbkdf2<D>(password: &[u8], salt: &[u8], iterations: u32) -> Vec<u8>
+where
+    D: EagerHash,
 {
     let mut salt_block = salt.to_vec();
     salt_block.extend_from_slice(&1u32.to_be_bytes());
 
-    let mut u = hmac_sha1(password, &salt_block);
-    let mut result = u;
+    let mut u = hmac_compute::<D>(password, &salt_block);
+    let mut result = u.clone();
 
     for _ in 1..iterations
     {
-        u = hmac_sha1(password, &u);
+        u = hmac_compute::<D>(password, &u);
         for (r, b) in result.iter_mut().zip(u.iter())
         {
             *r ^= b;
         }
     }
 
-    output.copy_from_slice(&result);
+    return result;
 }
 
-pub struct ScramSha1Client
+pub trait ScramAuth
+{
+    fn auth_xml(&mut self) -> String;
+    fn response_xml(&mut self, challenge_b64: &str) -> Result<String, String>;
+    fn verify_success(&self, success_b64: &str) -> Result<(), String>;
+}
+
+pub struct ScramClient<D>
 {
     username: String,
     password: String,
     nonce: String,
     client_first_bare: String,
-    salted_password: [u8; 20],
+    salted_password: Vec<u8>,
     auth_message: String,
+    mechanism_name: &'static str,
+    _marker: PhantomData<D>,
 }
 
-impl ScramSha1Client
+impl<D> ScramClient<D>
+where
+    D: EagerHash,
 {
-    pub fn new(username: &str, password: &str) -> Self
+    pub fn new(username: &str, password: &str, mechanism_name: &'static str) -> Self
     {
         use rand::RngExt;
 
@@ -63,8 +78,10 @@ impl ScramSha1Client
             password: password.to_string(),
             nonce,
             client_first_bare: String::new(),
-            salted_password: [0u8; 20],
+            salted_password: Vec::new(),
             auth_message: String::new(),
+            mechanism_name,
+            _marker: PhantomData,
         };
     }
 
@@ -76,7 +93,6 @@ impl ScramSha1Client
 
     fn client_final(&mut self, server_first: &str) -> Result<String, String>
     {
-        // Parse server-first-message: r=<nonce>,s=<salt>,i=<iterations>
         let mut server_nonce = "";
         let mut salt_b64 = "";
         let mut iterations: u32 = 0;
@@ -98,34 +114,25 @@ impl ScramSha1Client
 
         let salt = BASE64.decode(salt_b64).map_err(|e| e.to_string())?;
 
-        // SaltedPassword = PBKDF2-SHA1(password, salt, iterations)
-        pbkdf2_sha1(self.password.as_bytes(), &salt, iterations, &mut self.salted_password);
+        self.salted_password = pbkdf2::<D>(self.password.as_bytes(), &salt, iterations);
 
-        // ClientKey = HMAC-SHA1(SaltedPassword, "Client Key")
-        let client_key = hmac_sha1(&self.salted_password, b"Client Key");
+        let client_key = hmac_compute::<D>(&self.salted_password, b"Client Key");
+        let stored_key = D::digest(&client_key).to_vec();
 
-        // StoredKey = SHA1(ClientKey)
-        let stored_key: [u8; 20] = Sha1::digest(&client_key).into();
-
-        // client-final-without-proof
         let client_final_without_proof = format!("c=biws,r={}", server_nonce);
 
-        // AuthMessage = client-first-bare + "," + server-first + "," + client-final-without-proof
         self.auth_message = format!(
             "{},{},{}", self.client_first_bare, server_first, client_final_without_proof
         );
 
-        // ClientSignature = HMAC-SHA1(StoredKey, AuthMessage)
-        let client_signature = hmac_sha1(&stored_key, self.auth_message.as_bytes());
+        let client_signature = hmac_compute::<D>(&stored_key, self.auth_message.as_bytes());
 
-        // ClientProof = ClientKey XOR ClientSignature
-        let mut client_proof = [0u8; 20];
-        for i in 0..20
-        {
-            client_proof[i] = client_key[i] ^ client_signature[i];
-        }
+        let client_proof: Vec<u8> = client_key.iter()
+            .zip(client_signature.iter())
+            .map(|(k, s)| k ^ s)
+            .collect();
 
-        return Ok(format!("{},p={}", client_final_without_proof, BASE64.encode(client_proof)));
+        return Ok(format!("{},p={}", client_final_without_proof, BASE64.encode(&client_proof)));
     }
 
     fn verify_server(&self, server_final: &str) -> Result<(), String>
@@ -134,33 +141,34 @@ impl ScramSha1Client
             .ok_or("Invalid server final message")?;
         let server_sig = BASE64.decode(sig_b64).map_err(|e| e.to_string())?;
 
-        // ServerKey = HMAC-SHA1(SaltedPassword, "Server Key")
-        let server_key = hmac_sha1(&self.salted_password, b"Server Key");
+        let server_key = hmac_compute::<D>(&self.salted_password, b"Server Key");
+        let expected = hmac_compute::<D>(&server_key, self.auth_message.as_bytes());
 
-        // Expected = HMAC-SHA1(ServerKey, AuthMessage)
-        let expected = hmac_sha1(&server_key, self.auth_message.as_bytes());
-
-        if server_sig.as_slice() != expected.as_slice()
+        if server_sig != expected
         {
             return Err("Server signature verification failed".to_string());
         }
 
         return Ok(());
     }
+}
 
-    /// Build the `<auth>` XML stanza with base64-encoded client-first message.
-    pub fn auth_xml(&mut self) -> String
+impl<D> ScramAuth for ScramClient<D>
+where
+    D: EagerHash,
+{
+    fn auth_xml(&mut self) -> String
     {
         let client_first = self.client_first();
 
         return format!(
-            "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='SCRAM-SHA-1'>{}</auth>",
+            "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='{}'>{}</auth>",
+            self.mechanism_name,
             BASE64.encode(client_first.as_bytes())
         );
     }
 
-    /// Process a base64-encoded challenge and build the `<response>` XML stanza.
-    pub fn response_xml(&mut self, challenge_b64: &str) -> Result<String, String>
+    fn response_xml(&mut self, challenge_b64: &str) -> Result<String, String>
     {
         let challenge_bytes = BASE64.decode(challenge_b64).map_err(|e| e.to_string())?;
         let server_first = String::from_utf8(challenge_bytes).map_err(|e| e.to_string())?;
@@ -172,13 +180,43 @@ impl ScramSha1Client
         ));
     }
 
-    /// Verify the server's final message from a base64-encoded `<success>` body.
-    pub fn verify_success(&self, success_b64: &str) -> Result<(), String>
+    fn verify_success(&self, success_b64: &str) -> Result<(), String>
     {
         let success_bytes = BASE64.decode(success_b64).map_err(|e| e.to_string())?;
         let server_final = String::from_utf8(success_bytes).map_err(|e| e.to_string())?;
 
         return self.verify_server(&server_final);
+    }
+}
+
+pub type ScramSha1Client = ScramClient<Sha1>;
+pub type ScramSha256Client = ScramClient<Sha256>;
+pub type ScramSha512Client = ScramClient<Sha512>;
+
+pub struct PlainAuth
+{
+    username: String,
+    password: String,
+}
+
+impl PlainAuth
+{
+    pub fn new(username: &str, password: &str) -> Self
+    {
+        Self
+        {
+            username: username.to_string(),
+            password: password.to_string(),
+        }
+    }
+
+    pub fn auth_xml(&self) -> String
+    {
+        let payload = format!("\0{}\0{}", self.username, self.password);
+        return format!(
+            "<auth xmlns='urn:ietf:params:xml:ns:xmpp-sasl' mechanism='PLAIN'>{}</auth>",
+            BASE64.encode(payload.as_bytes())
+        );
     }
 }
 
@@ -252,8 +290,10 @@ mod tests
             password: "pencil".to_string(),
             nonce: "fyko+d2lbbFgONRv9qkxdawL".to_string(),
             client_first_bare: String::new(),
-            salted_password: [0u8; 20],
+            salted_password: Vec::new(),
             auth_message: String::new(),
+            mechanism_name: "SCRAM-SHA-1",
+            _marker: PhantomData,
         };
 
         let client_first = client.client_first();

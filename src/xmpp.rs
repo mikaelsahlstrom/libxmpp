@@ -50,15 +50,12 @@ pub async fn setup_connection(event_tx: &mpsc::Sender<XmppEvent>, jid: &str, pas
     // SASL authentication
     if let Some(ref mechs) = features.mechanisms
     {
-        if !mechs.mechanism.contains(&"SCRAM-SHA-1".to_string())
-        {
-            return Err("Server doesn't support SCRAM-SHA-1".to_string());
-        }
+        let mechanism = select_mechanism(&mechs.mechanism)?;
 
         let _ = event_tx.send(XmppEvent::Authenticating).await;
-        log::debug!("Starting SASL SCRAM-SHA-1 authentication...");
+        log::debug!("Starting SASL {:?} authentication...", mechanism);
 
-        do_sasl(&mut tcp, &mut framer, &username, password).await?;
+        do_sasl(&mut tcp, &mut framer, &username, password, &mechanism).await?;
         framer.reset();
 
         log::debug!("SASL authentication successful");
@@ -128,15 +125,64 @@ async fn read_stream_and_features(
     return Ok((stream, features));
 }
 
+#[derive(Debug)]
+enum SaslMechanism
+{
+    ScramSha512,
+    ScramSha256,
+    ScramSha1,
+    Plain,
+}
+
+fn select_mechanism(mechanisms: &[String]) -> Result<SaslMechanism, String>
+{
+    if mechanisms.iter().any(|m| m == "SCRAM-SHA-512") { return Ok(SaslMechanism::ScramSha512); }
+    if mechanisms.iter().any(|m| m == "SCRAM-SHA-256") { return Ok(SaslMechanism::ScramSha256); }
+    if mechanisms.iter().any(|m| m == "SCRAM-SHA-1") { return Ok(SaslMechanism::ScramSha1); }
+    if mechanisms.iter().any(|m| m == "PLAIN") { return Ok(SaslMechanism::Plain); }
+
+    return Err("No supported SASL mechanism found".to_string());
+}
+
 async fn do_sasl(
     tcp: &mut Tcp,
     framer: &mut XmlFramer,
     username: &str,
     password: &str,
+    mechanism: &SaslMechanism,
 ) -> Result<(), String>
 {
-    let mut scram = stanza::sasl::ScramSha1Client::new(username, password);
+    match mechanism
+    {
+        SaslMechanism::ScramSha512 =>
+        {
+            let mut scram = stanza::sasl::ScramSha512Client::new(username, password, "SCRAM-SHA-512");
+            do_sasl_scram(tcp, framer, &mut scram).await
+        }
+        SaslMechanism::ScramSha256 =>
+        {
+            let mut scram = stanza::sasl::ScramSha256Client::new(username, password, "SCRAM-SHA-256");
+            do_sasl_scram(tcp, framer, &mut scram).await
+        }
+        SaslMechanism::ScramSha1 =>
+        {
+            let mut scram = stanza::sasl::ScramSha1Client::new(username, password, "SCRAM-SHA-1");
+            do_sasl_scram(tcp, framer, &mut scram).await
+        }
+        SaslMechanism::Plain =>
+        {
+            let auth = stanza::sasl::PlainAuth::new(username, password);
+            do_sasl_plain(tcp, framer, &auth).await
+        }
+    }
+}
 
+async fn do_sasl_scram(
+    tcp: &mut Tcp,
+    framer: &mut XmlFramer,
+    scram: &mut dyn stanza::sasl::ScramAuth,
+) -> Result<(), String>
+{
     // Send <auth>
     tcp.send(scram.auth_xml().as_bytes()).await?;
 
@@ -162,6 +208,23 @@ async fn do_sasl(
 
     let success_b64 = stanza::sasl::parse_success(&success_xml)?;
     scram.verify_success(&success_b64)?;
+
+    return Ok(());
+}
+
+async fn do_sasl_plain(
+    tcp: &mut Tcp,
+    framer: &mut XmlFramer,
+    auth: &stanza::sasl::PlainAuth,
+) -> Result<(), String>
+{
+    tcp.send(auth.auth_xml().as_bytes()).await?;
+
+    let response_xml = read_frame(tcp, framer).await?;
+    if stanza::sasl::is_failure(&response_xml)
+    {
+        return Err(format!("SASL auth failed: {}", response_xml));
+    }
 
     return Ok(());
 }

@@ -11,6 +11,11 @@ impl XmlFramer
         return Self { buffer: String::new(), stream_opened: false };
     }
 
+    pub fn new_opened() -> Self
+    {
+        return Self { buffer: String::new(), stream_opened: true };
+    }
+
     pub fn feed(&mut self, data: &[u8])
     {
         self.buffer.push_str(&String::from_utf8_lossy(data));
