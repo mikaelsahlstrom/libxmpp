@@ -1,5 +1,6 @@
 use base64::{ Engine, engine::general_purpose::STANDARD as BASE64 };
 use hmac::{ Hmac, Mac };
+use hmac::digest::KeyInit;
 use sha1::{ Sha1, Digest };
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -12,6 +13,26 @@ fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20]
     mac.update(data);
 
     return mac.finalize().into_bytes().into();
+}
+
+fn pbkdf2_sha1(password: &[u8], salt: &[u8], iterations: u32, output: &mut [u8; 20])
+{
+    let mut salt_block = salt.to_vec();
+    salt_block.extend_from_slice(&1u32.to_be_bytes());
+
+    let mut u = hmac_sha1(password, &salt_block);
+    let mut result = u;
+
+    for _ in 1..iterations
+    {
+        u = hmac_sha1(password, &u);
+        for (r, b) in result.iter_mut().zip(u.iter())
+        {
+            *r ^= b;
+        }
+    }
+
+    output.copy_from_slice(&result);
 }
 
 pub struct ScramSha1Client
@@ -28,10 +49,10 @@ impl ScramSha1Client
 {
     pub fn new(username: &str, password: &str) -> Self
     {
-        use rand::Rng;
+        use rand::RngExt;
 
-        let nonce: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
+        let nonce: String = rand::rng()
+            .sample_iter(&rand::distr::Alphanumeric)
             .take(24)
             .map(char::from)
             .collect();
@@ -78,9 +99,7 @@ impl ScramSha1Client
         let salt = BASE64.decode(salt_b64).map_err(|e| e.to_string())?;
 
         // SaltedPassword = PBKDF2-SHA1(password, salt, iterations)
-        pbkdf2::pbkdf2_hmac::<Sha1>(
-            self.password.as_bytes(), &salt, iterations, &mut self.salted_password
-        );
+        pbkdf2_sha1(self.password.as_bytes(), &salt, iterations, &mut self.salted_password);
 
         // ClientKey = HMAC-SHA1(SaltedPassword, "Client Key")
         let client_key = hmac_sha1(&self.salted_password, b"Client Key");
@@ -199,7 +218,7 @@ fn extract_element_text(xml: &str, element: &str) -> Result<String, String>
             }
             Ok(Event::Text(e)) if in_element =>
             {
-                return Ok(e.unescape().map_err(|e| e.to_string())?.to_string());
+                return Ok(e.decode().map_err(|e| e.to_string())?.to_string());
             }
             Ok(Event::End(_)) if in_element =>
             {

@@ -1,6 +1,7 @@
 pub mod stream;
 pub mod sasl;
 pub mod bind;
+pub mod muc;
 
 pub trait Stanza
 {
