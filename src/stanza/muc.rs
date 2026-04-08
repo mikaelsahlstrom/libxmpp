@@ -68,7 +68,7 @@ pub struct MucPresence
 pub struct MucUserX
 {
     #[serde(default)]
-    pub item: Option<MucItem>,
+    pub item: Vec<MucItem>,
     #[serde(rename = "status", default)]
     pub status: Vec<MucStatus>,
 }
@@ -87,6 +87,44 @@ pub struct MucStatus
 {
     #[serde(rename = "@code")]
     pub code: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename = "message")]
+pub struct MucMessage
+{
+    #[serde(rename = "@from", default)]
+    pub from: Option<String>,
+    #[serde(rename = "@type", default)]
+    pub message_type: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub delay: Option<MessageDelay>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct MessageDelay
+{
+    #[serde(rename = "@stamp", default)]
+    pub stamp: Option<String>,
+}
+
+impl MucMessage
+{
+    pub fn from_xml(xml: &str) -> Result<Self, String>
+    {
+        quick_xml::de::from_str(xml).map_err(|e| e.to_string())
+    }
+
+    pub fn room_and_nick(&self) -> Option<(&str, &str)>
+    {
+        let from = self.from.as_deref()?;
+        let slash = from.find('/')?;
+        Some((&from[..slash], &from[slash + 1..]))
+    }
 }
 
 impl MucPresence

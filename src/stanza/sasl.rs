@@ -39,7 +39,7 @@ where
     return result;
 }
 
-pub trait ScramAuth
+pub trait ScramAuth: Send
 {
     fn auth_xml(&mut self) -> String;
     fn response_xml(&mut self, challenge_b64: &str) -> Result<String, String>;
@@ -155,7 +155,7 @@ where
 
 impl<D> ScramAuth for ScramClient<D>
 where
-    D: EagerHash,
+    D: EagerHash + Send,
 {
     fn auth_xml(&mut self) -> String
     {

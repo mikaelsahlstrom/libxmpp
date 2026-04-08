@@ -22,6 +22,8 @@ pub enum XmppEvent
     RoomJoined { room: String, members: Vec<RoomMember> },
     MemberJoined { room: String, member: RoomMember },
     MemberLeft { room: String, nick: String },
+    RoomMessage { room: String, nick: String, body: String, timestamp: Option<String> },
+    RoomSubject { room: String, subject: String },
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +61,7 @@ impl XmppClient
         {
             let mut framer = XmlFramer::new_opened();
             let mut pending_joins: HashMap<String, Vec<RoomMember>> = HashMap::new();
+            let mut pending_messages: HashMap<String, Vec<XmppEvent>> = HashMap::new();
             let mut joined_rooms: HashSet<String> = HashSet::new();
 
             loop
@@ -67,7 +70,7 @@ impl XmppClient
                 while let Some(stanza_xml) = framer.try_next()
                 {
                     log::debug!("Received stanza: {}", stanza_xml);
-                    xmpp::process_stanza(&stanza_xml, &event_tx_loop, &mut pending_joins, &mut joined_rooms).await;
+                    xmpp::process_stanza(&stanza_xml, &event_tx_loop, &mut pending_joins, &mut pending_messages, &mut joined_rooms).await;
                 }
 
                 // Collect data.

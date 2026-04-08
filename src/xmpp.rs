@@ -254,6 +254,7 @@ pub async fn process_stanza(
     xml: &str,
     event_tx: &mpsc::Sender<XmppEvent>,
     pending_joins: &mut HashMap<String, Vec<RoomMember>>,
+    pending_messages: &mut HashMap<String, Vec<XmppEvent>>,
     joined_rooms: &mut HashSet<String>,
 )
 {
@@ -299,8 +300,8 @@ pub async fn process_stanza(
             let member = RoomMember
             {
                 nick: nick.to_string(),
-                affiliation: x.item.as_ref().and_then(|i| i.affiliation.clone()).unwrap_or_default(),
-                role: x.item.as_ref().and_then(|i| i.role.clone()).unwrap_or_default(),
+                affiliation: x.item.first().and_then(|i| i.affiliation.clone()).unwrap_or_default(),
+                role: x.item.first().and_then(|i| i.role.clone()).unwrap_or_default(),
             };
 
             if joined_rooms.contains(room)
@@ -325,7 +326,79 @@ pub async fn process_stanza(
                         room: room.to_string(),
                         members,
                     }).await;
+
+                    for event in pending_messages.remove(room).unwrap_or_default()
+                    {
+                        let _ = event_tx.send(event).await;
+                    }
                 }
+            }
+        }
+    }
+    else if xml.contains("<message") && xml.contains("type='groupchat'")
+    {
+        let msg = match stanza::muc::MucMessage::from_xml(xml)
+        {
+            Ok(m) => m,
+            Err(e) =>
+            {
+                log::warn!("Failed to parse MUC message: {}", e);
+                return;
+            }
+        };
+
+        let (room, nick) = match msg.room_and_nick()
+        {
+            Some(v) => v,
+            None => return,
+        };
+
+        if joined_rooms.contains(room)
+        {
+            if let Some(ref subject) = msg.subject
+            {
+                let _ = event_tx.send(XmppEvent::RoomSubject
+                {
+                    room: room.to_string(),
+                    subject: subject.clone(),
+                }).await;
+            }
+
+            if let Some(ref body) = msg.body
+            {
+                let timestamp = msg.delay.as_ref().and_then(|d| d.stamp.clone());
+                let _ = event_tx.send(XmppEvent::RoomMessage
+                {
+                    room: room.to_string(),
+                    nick: nick.to_string(),
+                    body: body.clone(),
+                    timestamp,
+                }).await;
+            }
+        }
+        else if pending_joins.contains_key(room)
+        {
+            let messages = pending_messages.entry(room.to_string()).or_default();
+
+            if let Some(ref subject) = msg.subject
+            {
+                messages.push(XmppEvent::RoomSubject
+                {
+                    room: room.to_string(),
+                    subject: subject.clone(),
+                });
+            }
+
+            if let Some(ref body) = msg.body
+            {
+                let timestamp = msg.delay.as_ref().and_then(|d| d.stamp.clone());
+                messages.push(XmppEvent::RoomMessage
+                {
+                    room: room.to_string(),
+                    nick: nick.to_string(),
+                    body: body.clone(),
+                    timestamp,
+                });
             }
         }
     }
