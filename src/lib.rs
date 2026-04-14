@@ -20,6 +20,7 @@ pub enum XmppEvent
     Authenticating,
     Connected,
     RoomJoined { room: String, members: Vec<RoomMember> },
+    RoomLeft(String),
     MemberJoined { room: String, member: RoomMember },
     MemberLeft { room: String, nick: String },
     RoomMessage { room: String, nick: String, body: String, timestamp: Option<String> },
@@ -112,6 +113,12 @@ impl XmppClient
     pub async fn join_room(&mut self, room_jid: &str, nick: &str) -> Result<(), String>
     {
         let presence = stanza::muc::MucJoinPresence::new(room_jid.to_string(), nick.to_string());
+        self.writer.write(&presence.as_bytes()).await
+    }
+
+    pub async fn leave_room(&mut self, room_jid: &str, nick: &str) -> Result<(), String>
+    {
+        let presence = stanza::muc::MucLeavePresence::new(room_jid.to_string(), nick.to_string());
         self.writer.write(&presence.as_bytes()).await
     }
 

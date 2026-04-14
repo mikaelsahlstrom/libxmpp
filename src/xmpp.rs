@@ -283,6 +283,7 @@ pub async fn process_stanza(
             if presence.is_self_presence()
             {
                 joined_rooms.remove(room);
+                let _ = event_tx.send(XmppEvent::RoomLeft(room.to_string())).await;
             }
             else
             {

@@ -52,6 +52,31 @@ impl Stanza for MucJoinPresence
     }
 }
 
+pub struct MucLeavePresence
+{
+    room_jid: String,
+    nick: String,
+}
+
+impl MucLeavePresence
+{
+    pub fn new(room_jid: String, nick: String) -> Self
+    {
+        Self { room_jid, nick }
+    }
+}
+
+impl Stanza for MucLeavePresence
+{
+    fn to_xml(&self) -> String
+    {
+        format!(
+            "<presence type='unavailable' to='{}/{}'/>",
+            self.room_jid, self.nick
+        )
+    }
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename = "presence")]
 pub struct MucPresence
