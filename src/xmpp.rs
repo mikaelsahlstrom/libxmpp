@@ -295,13 +295,13 @@ pub async fn process_stanza(
             return;
         }
 
-        if let Some(ref x) = presence.x
+        if let Some(x) = presence.muc_user_x()
         {
             let member = RoomMember
             {
                 nick: nick.to_string(),
-                affiliation: x.item.first().and_then(|i| i.affiliation.clone()).unwrap_or_default(),
-                role: x.item.first().and_then(|i| i.role.clone()).unwrap_or_default(),
+                affiliation: x.items().next().and_then(|i| i.affiliation.clone()).unwrap_or_default(),
+                role: x.items().next().and_then(|i| i.role.clone()).unwrap_or_default(),
             };
 
             if joined_rooms.contains(room)
