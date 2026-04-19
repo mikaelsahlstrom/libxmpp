@@ -85,12 +85,19 @@ pub struct MucPresence
     pub from: String,
     #[serde(rename = "@type", default)]
     pub presence_type: Option<String>,
-    #[serde(default)]
-    pub show: Option<String>,
-    #[serde(default)]
-    pub status: Option<String>,
-    #[serde(default)]
-    pub x: Vec<MucUserX>,
+    #[serde(rename = "$value", default)]
+    children: Vec<MucPresenceChild>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+enum MucPresenceChild
+{
+    Show(String),
+    Status(String),
+    X(MucUserX),
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Deserialize, Debug)]
@@ -198,9 +205,31 @@ impl MucPresence
         Some((&self.from[..slash], &self.from[slash + 1..]))
     }
 
+    pub fn show(&self) -> Option<&str>
+    {
+        self.children.iter().find_map(|c| match c
+        {
+            MucPresenceChild::Show(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    pub fn status(&self) -> Option<&str>
+    {
+        self.children.iter().find_map(|c| match c
+        {
+            MucPresenceChild::Status(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
     pub fn muc_user_x(&self) -> Option<&MucUserX>
     {
-        self.x.iter().find(|x| !x.children.is_empty())
+        self.children.iter().find_map(|c| match c
+        {
+            MucPresenceChild::X(x) if !x.children.is_empty() => Some(x),
+            _ => None,
+        })
     }
 
     pub fn is_self_presence(&self) -> bool
