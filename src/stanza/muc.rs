@@ -106,6 +106,8 @@ enum MucUserXChild
 {
     Item(MucItem),
     Status(MucStatus),
+    #[serde(other)]
+    Other,
 }
 
 impl MucUserX
