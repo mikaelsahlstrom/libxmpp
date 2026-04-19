@@ -33,6 +33,8 @@ pub struct RoomMember
     pub nick: String,
     pub affiliation: String,
     pub role: String,
+    pub show: Option<String>,
+    pub status: Option<String>,
 }
 
 pub struct XmppClient
