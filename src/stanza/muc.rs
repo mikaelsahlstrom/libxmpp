@@ -86,6 +86,10 @@ pub struct MucPresence
     #[serde(rename = "@type", default)]
     pub presence_type: Option<String>,
     #[serde(default)]
+    pub show: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
     pub x: Vec<MucUserX>,
 }
 

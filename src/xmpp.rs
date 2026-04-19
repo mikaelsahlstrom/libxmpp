@@ -303,6 +303,8 @@ pub async fn process_stanza(
                 nick: nick.to_string(),
                 affiliation: x.items().next().and_then(|i| i.affiliation.clone()).unwrap_or_default(),
                 role: x.items().next().and_then(|i| i.role.clone()).unwrap_or_default(),
+                show: presence.show.clone(),
+                status: presence.status.clone(),
             };
 
             if joined_rooms.contains(room)
