@@ -136,6 +136,15 @@ impl MucUserX
             _ => None,
         })
     }
+
+    pub fn jid(&self) -> Option<&str>
+    {
+        self.children.iter().find_map(|c| match c
+        {
+            MucUserXChild::Item(i) => i.jid.as_deref(),
+            _ => None,
+        })
+    }
 }
 
 #[derive(Deserialize, Debug)]
@@ -145,6 +154,8 @@ pub struct MucItem
     pub affiliation: Option<String>,
     #[serde(rename = "@role", default)]
     pub role: Option<String>,
+    #[serde(rename = "@jid", default)]
+    pub jid: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -181,14 +192,14 @@ impl MucMessage
 {
     pub fn from_xml(xml: &str) -> Result<Self, String>
     {
-        quick_xml::de::from_str(xml).map_err(|e| e.to_string())
+        return quick_xml::de::from_str(xml).map_err(|e| e.to_string());
     }
 
     pub fn room_and_nick(&self) -> Option<(&str, &str)>
     {
         let from = self.from.as_deref()?;
         let slash = from.find('/')?;
-        Some((&from[..slash], &from[slash + 1..]))
+        return Some((&from[..slash], &from[slash + 1..]));
     }
 }
 
@@ -196,46 +207,46 @@ impl MucPresence
 {
     pub fn from_xml(xml: &str) -> Result<Self, String>
     {
-        quick_xml::de::from_str(xml).map_err(|e| e.to_string())
+        return quick_xml::de::from_str(xml).map_err(|e| e.to_string());
     }
 
     pub fn room_and_nick(&self) -> Option<(&str, &str)>
     {
         let slash = self.from.find('/')?;
-        Some((&self.from[..slash], &self.from[slash + 1..]))
+        return Some((&self.from[..slash], &self.from[slash + 1..]));
     }
 
     pub fn show(&self) -> Option<&str>
     {
-        self.children.iter().find_map(|c| match c
+        return self.children.iter().find_map(|c| match c
         {
             MucPresenceChild::Show(s) => Some(s.as_str()),
             _ => None,
-        })
+        });
     }
 
     pub fn status(&self) -> Option<&str>
     {
-        self.children.iter().find_map(|c| match c
+        return self.children.iter().find_map(|c| match c
         {
             MucPresenceChild::Status(s) => Some(s.as_str()),
             _ => None,
-        })
+        });
     }
 
     pub fn muc_user_x(&self) -> Option<&MucUserX>
     {
-        self.children.iter().find_map(|c| match c
+        return self.children.iter().find_map(|c| match c
         {
             MucPresenceChild::X(x) if !x.children.is_empty() => Some(x),
             _ => None,
-        })
+        });
     }
 
     pub fn is_self_presence(&self) -> bool
     {
-        self.muc_user_x()
+        return self.muc_user_x()
             .map(|x| x.statuses().any(|s| s.code == "110"))
-            .unwrap_or(false)
+            .unwrap_or(false);
     }
 }

@@ -30,6 +30,7 @@ pub enum XmppEvent
 #[derive(Debug, Clone)]
 pub struct RoomMember
 {
+    pub jid: Option<String>,
     pub nick: String,
     pub affiliation: String,
     pub role: String,
