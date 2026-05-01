@@ -300,6 +300,7 @@ pub async fn process_stanza(
         {
             let member = RoomMember
             {
+                jid: x.jid().map(|s| s.to_string()),
                 nick: nick.to_string(),
                 affiliation: x.items().next().and_then(|i| i.affiliation.clone()).unwrap_or_default(),
                 role: x.items().next().and_then(|i| i.role.clone()).unwrap_or_default(),
