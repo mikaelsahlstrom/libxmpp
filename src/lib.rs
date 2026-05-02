@@ -25,6 +25,7 @@ pub enum XmppEvent
     MemberLeft { room: String, nick: String },
     RoomMessage { room: String, nick: String, body: String, timestamp: Option<String> },
     RoomSubject { room: String, subject: String },
+    PresenceError { from: String, error_type: String, condition: String, text: Option<String> },
 }
 
 #[derive(Debug, Clone)]
