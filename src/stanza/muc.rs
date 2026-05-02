@@ -203,6 +203,104 @@ impl MucMessage
     }
 }
 
+pub struct PresenceErrorStanza
+{
+    pub from: String,
+    pub error_type: String,
+    pub condition: String,
+    pub text: Option<String>,
+}
+
+impl PresenceErrorStanza
+{
+    pub fn from_xml(xml: &str) -> Result<Self, String>
+    {
+        use quick_xml::Reader;
+        use quick_xml::events::Event;
+
+        let mut reader = Reader::from_str(xml);
+        reader.config_mut().trim_text(true);
+
+        let mut from = String::new();
+        let mut error_type = String::new();
+        let mut condition = String::new();
+        let mut text: Option<String> = None;
+        let mut in_error = false;
+        let mut in_text = false;
+
+        loop
+        {
+            match reader.read_event().map_err(|e| e.to_string())?
+            {
+                Event::Start(ref e) | Event::Empty(ref e) =>
+                {
+                    let local = e.local_name();
+                    let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                    match tag
+                    {
+                        "presence" =>
+                        {
+                            for attr in e.attributes().flatten()
+                            {
+                                if attr.key.local_name().as_ref() == b"from"
+                                {
+                                    from = attr.unescape_value()
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_default();
+                                }
+                            }
+                        }
+                        "error" =>
+                        {
+                            in_error = true;
+                            for attr in e.attributes().flatten()
+                            {
+                                if attr.key.local_name().as_ref() == b"type"
+                                {
+                                    error_type = attr.unescape_value()
+                                        .map(|v| v.to_string())
+                                        .unwrap_or_default();
+                                }
+                            }
+                        }
+                        "text" if in_error => in_text = true,
+                        other if in_error && other != "text" && condition.is_empty() =>
+                        {
+                            condition = other.to_string();
+                        }
+                        _ => {}
+                    }
+                }
+                Event::Text(e) if in_text =>
+                {
+                    text = std::str::from_utf8(e.as_ref()).ok().map(|s| s.to_string());
+                    in_text = false;
+                }
+                Event::End(ref e) =>
+                {
+                    let local = e.local_name();
+                    let tag = std::str::from_utf8(local.as_ref()).unwrap_or("");
+                    match tag
+                    {
+                        "error" => in_error = false,
+                        "text" => in_text = false,
+                        _ => {}
+                    }
+                }
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+
+        if from.is_empty()
+        {
+            return Err("Missing @from in presence error".to_string());
+        }
+
+        return Ok(Self { from, error_type, condition, text });
+    }
+}
+
 impl MucPresence
 {
     pub fn from_xml(xml: &str) -> Result<Self, String>
@@ -248,5 +346,42 @@ impl MucPresence
         return self.muc_user_x()
             .map(|x| x.statuses().any(|s| s.code == "110"))
             .unwrap_or(false);
+    }
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn parse_presence_error()
+    {
+        let xml = "<presence type='error' to='user@example.com/res' from='room@conference.example.com'>\
+            <error type='cancel' by='conference.example.com'>\
+            <remote-server-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>\
+            <text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'>Server-to-server connection failed: unable to resolve service</text>\
+            </error></presence>";
+
+        let err = PresenceErrorStanza::from_xml(xml).unwrap();
+        assert_eq!(err.from, "room@conference.example.com");
+        assert_eq!(err.error_type, "cancel");
+        assert_eq!(err.condition, "remote-server-not-found");
+        assert_eq!(err.text.as_deref(), Some("Server-to-server connection failed: unable to resolve service"));
+    }
+
+    #[test]
+    fn parse_presence_error_no_text()
+    {
+        let xml = "<presence type='error' from='room@conference.example.com'>\
+            <error type='auth'>\
+            <forbidden xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>\
+            </error></presence>";
+
+        let err = PresenceErrorStanza::from_xml(xml).unwrap();
+        assert_eq!(err.from, "room@conference.example.com");
+        assert_eq!(err.error_type, "auth");
+        assert_eq!(err.condition, "forbidden");
+        assert!(err.text.is_none());
     }
 }

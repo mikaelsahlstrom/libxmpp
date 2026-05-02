@@ -258,7 +258,36 @@ pub async fn process_stanza(
     joined_rooms: &mut HashSet<String>,
 )
 {
-    if xml.contains("<presence") && xml.contains("http://jabber.org/protocol/muc#user")
+    if xml.contains("<presence") && xml.contains("type='error'")
+    {
+        let error = match stanza::muc::PresenceErrorStanza::from_xml(xml)
+        {
+            Ok(e) => e,
+            Err(e) =>
+            {
+                log::warn!("Failed to parse presence error: {}", e);
+                return;
+            }
+        };
+
+        let room = match error.from.find('/')
+        {
+            Some(slash) => &error.from[..slash],
+            None => &error.from,
+        };
+
+        pending_joins.remove(room);
+        pending_messages.remove(room);
+
+        let _ = event_tx.send(XmppEvent::PresenceError
+        {
+            from: error.from,
+            error_type: error.error_type,
+            condition: error.condition,
+            text: error.text,
+        }).await;
+    }
+    else if xml.contains("<presence") && xml.contains("http://jabber.org/protocol/muc#user")
     {
         let presence = match stanza::muc::MucPresence::from_xml(xml)
         {
