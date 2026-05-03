@@ -26,6 +26,7 @@ pub enum XmppEvent
     RoomMessage { room: String, nick: String, body: String, timestamp: Option<String> },
     RoomSubject { room: String, subject: String },
     PresenceError { from: String, error_type: String, condition: String, text: Option<String> },
+    DirectMessage { from: String, body: String, timestamp: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -117,19 +118,25 @@ impl XmppClient
     pub async fn join_room(&mut self, room_jid: &str, nick: &str) -> Result<(), String>
     {
         let presence = stanza::muc::MucJoinPresence::new(room_jid.to_string(), nick.to_string());
-        self.writer.write(&presence.as_bytes()).await
+        return self.writer.write(&presence.as_bytes()).await;
     }
 
     pub async fn leave_room(&mut self, room_jid: &str, nick: &str) -> Result<(), String>
     {
         let presence = stanza::muc::MucLeavePresence::new(room_jid.to_string(), nick.to_string());
-        self.writer.write(&presence.as_bytes()).await
+        return self.writer.write(&presence.as_bytes()).await;
     }
 
     pub async fn send_room_message(&mut self, room_jid: &str, body: &str) -> Result<(), String>
     {
         let msg = stanza::muc::MucGroupMessage::new(room_jid.to_string(), body.to_string());
-        self.writer.write(&msg.as_bytes()).await
+        return self.writer.write(&msg.as_bytes()).await;
+    }
+
+    pub async fn send_message(&mut self, to: &str, body: &str) -> Result<(), String>
+    {
+        let msg = stanza::chat::ChatMessage::new(to.to_string(), body.to_string());
+        return self.writer.write(&msg.as_bytes()).await;
     }
 
     pub async fn close(mut self)
