@@ -368,6 +368,24 @@ pub async fn process_stanza(
             }
         }
     }
+    else if xml.contains("<message") && xml.contains("type='chat'")
+    {
+        let msg = match stanza::chat::IncomingChatMessage::from_xml(xml)
+        {
+            Ok(m) => m,
+            Err(e) =>
+            {
+                log::warn!("Failed to parse chat message: {}", e);
+                return;
+            }
+        };
+
+        if let (Some(from), Some(body)) = (msg.from, msg.body)
+        {
+            let timestamp = msg.delay.and_then(|d| d.stamp);
+            let _ = event_tx.send(XmppEvent::DirectMessage { from, body, timestamp }).await;
+        }
+    }
     else if xml.contains("<message") && xml.contains("type='groupchat'")
     {
         let msg = match stanza::muc::MucMessage::from_xml(xml)

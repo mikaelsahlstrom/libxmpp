@@ -2,6 +2,7 @@ pub mod stream;
 pub mod sasl;
 pub mod bind;
 pub mod muc;
+pub mod chat;
 
 pub trait Stanza
 {
