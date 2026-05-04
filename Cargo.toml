@@ -1,5 +1,7 @@
 [package]
 name = "libxmpp"
+description = "A small async XMPP client library built on Tokio"
+license = "MIT"
 homepage = "https://github.com/mikaelsahlstrom/libxmpp"
 repository = "https://github.com/mikaelsahlstrom/libxmpp"
 version = "0.1.1"
