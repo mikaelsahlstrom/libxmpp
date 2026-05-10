@@ -258,7 +258,7 @@ pub async fn process_stanza(
     joined_rooms: &mut HashSet<String>,
 )
 {
-    if xml.contains("<presence") && xml.contains("type='error'")
+    if xml.contains("<presence") && (xml.contains("type='error'") || xml.contains("type=\"error\""))
     {
         let error = match stanza::muc::PresenceErrorStanza::from_xml(xml)
         {
@@ -368,7 +368,7 @@ pub async fn process_stanza(
             }
         }
     }
-    else if xml.contains("<message") && xml.contains("type='chat'")
+    else if xml.contains("<message") && (xml.contains("type='chat'") || xml.contains("type=\"chat\""))
     {
         let msg = match stanza::chat::IncomingChatMessage::from_xml(xml)
         {
@@ -386,7 +386,7 @@ pub async fn process_stanza(
             let _ = event_tx.send(XmppEvent::DirectMessage { from, body, timestamp }).await;
         }
     }
-    else if xml.contains("<message") && xml.contains("type='groupchat'")
+    else if xml.contains("<message") && (xml.contains("type='groupchat'") || xml.contains("type=\"groupchat\""))
     {
         let msg = match stanza::muc::MucMessage::from_xml(xml)
         {
