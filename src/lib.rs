@@ -165,7 +165,11 @@ impl XmppClient
         let (bound_jid, tcp) = xmpp::setup_connection(&event_tx, jid, password).await?;
 
         // We now have a working xmpp connection, split and spawn reader loop.
-        let (mut reader, writer) = tcp.split()?;
+        let (mut reader, mut writer) = tcp.split()?;
+
+        // Broadcast initial available presence so the server routes
+        // incoming directed messages (e.g. one-to-one chats) to this resource.
+        writer.write(b"<presence/>").await?;
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
         let event_tx_loop = event_tx.clone();
