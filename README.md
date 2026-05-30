@@ -5,7 +5,7 @@ An async XMPP client library for Rust, built on Tokio.
 ## Features
 
 - TCP + STARTTLS connection handling
-- SASL authentication (PLAIN, SCRAM-SHA-1, SCRAM-SHA-256)
+- SASL authentication (SCRAM-SHA-512, SCRAM-SHA-256, SCRAM-SHA-1, PLAIN)
 - Resource binding
 - One-to-one chat messages
 - Multi-User Chat (MUC) rooms: join, leave, send and receive group messages
@@ -44,7 +44,7 @@ item, including the meaning of every `XmppEvent` variant.
 use xmpp::{XmppClient, XmppEvent};
 
 #[tokio::main]
-async fn main() -> Result<(), String>
+async fn main() -> Result<(), xmpp::XmppError>
 {
     let (mut client, mut events) =
         XmppClient::new("user@example.com", "password").await?;
