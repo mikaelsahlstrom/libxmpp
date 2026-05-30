@@ -11,7 +11,7 @@
 //! ```no_run
 //! use xmpp::{XmppClient, XmppEvent};
 //!
-//! # async fn run() -> Result<(), String> {
+//! # async fn run() -> Result<(), xmpp::XmppError> {
 //! let (mut client, mut events) =
 //!     XmppClient::new("user@example.com", "password").await?;
 //!
@@ -44,11 +44,13 @@ use tokio::task::JoinHandle;
 use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 
+mod error;
 mod tcp_stream;
 mod xml_framer;
 mod stanza;
 mod xmpp;
 
+pub use error::XmppError;
 use stanza::Stanza;
 use xml_framer::XmlFramer;
 
@@ -157,7 +159,7 @@ impl XmppClient
     /// Returns `Err` with a human-readable description if the TCP
     /// connection, TLS upgrade, SASL authentication, or resource
     /// binding fails.
-    pub async fn new(jid: &str, password: &str) -> Result<(Self, mpsc::Receiver<XmppEvent>), String>
+    pub async fn new(jid: &str, password: &str) -> Result<(Self, mpsc::Receiver<XmppEvent>), XmppError>
     {
         let (event_tx, event_rx) = mpsc::channel(32);
 
@@ -235,7 +237,7 @@ impl XmppClient
     /// use inside the room. When the server accepts the join, a
     /// [`RoomJoined`](XmppEvent::RoomJoined) event is delivered with
     /// the initial roster.
-    pub async fn join_room(&mut self, room_jid: &str, nick: &str) -> Result<(), String>
+    pub async fn join_room(&mut self, room_jid: &str, nick: &str) -> Result<(), XmppError>
     {
         let presence = stanza::muc::MucJoinPresence::new(room_jid.to_string(), nick.to_string());
         return self.writer.write(&presence.as_bytes()).await;
@@ -245,7 +247,7 @@ impl XmppClient
     ///
     /// On success a [`RoomLeft`](XmppEvent::RoomLeft) event is emitted
     /// once the server confirms the departure.
-    pub async fn leave_room(&mut self, room_jid: &str, nick: &str) -> Result<(), String>
+    pub async fn leave_room(&mut self, room_jid: &str, nick: &str) -> Result<(), XmppError>
     {
         let presence = stanza::muc::MucLeavePresence::new(room_jid.to_string(), nick.to_string());
         return self.writer.write(&presence.as_bytes()).await;
@@ -255,7 +257,7 @@ impl XmppClient
     ///
     /// `room_jid` is the bare JID of the room. The local user must
     /// already have joined the room.
-    pub async fn send_room_message(&mut self, room_jid: &str, body: &str) -> Result<(), String>
+    pub async fn send_room_message(&mut self, room_jid: &str, body: &str) -> Result<(), XmppError>
     {
         let msg = stanza::muc::MucGroupMessage::new(room_jid.to_string(), body.to_string());
         return self.writer.write(&msg.as_bytes()).await;
@@ -265,7 +267,7 @@ impl XmppClient
     ///
     /// `to` is the recipient's bare or full JID. Replies will arrive
     /// as [`DirectMessage`](XmppEvent::DirectMessage) events.
-    pub async fn send_message(&mut self, to: &str, body: &str) -> Result<(), String>
+    pub async fn send_message(&mut self, to: &str, body: &str) -> Result<(), XmppError>
     {
         let msg = stanza::chat::ChatMessage::new(to.to_string(), body.to_string());
         return self.writer.write(&msg.as_bytes()).await;

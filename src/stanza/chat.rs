@@ -21,7 +21,7 @@ impl Stanza for ChatMessage
     {
         return format!(
             "<message type='chat' to='{}'><body>{}</body></message>",
-            self.to,
+            quick_xml::escape::escape(&self.to),
             quick_xml::escape::escape(&self.body)
         );
     }

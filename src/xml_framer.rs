@@ -1,6 +1,34 @@
+/// Find the first occurrence of `needle` within `haystack`, returning its
+/// start offset. Used for byte-oriented scanning of the buffer.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize>
+{
+    if needle.is_empty()
+    {
+        return Some(0);
+    }
+
+    return haystack.windows(needle.len()).position(|w| w == needle);
+}
+
+/// Outcome of scanning the buffer for a complete top-level stanza.
+enum StanzaEnd
+{
+    /// A complete stanza ends `end` bytes into the scanned slice.
+    Frame(usize),
+    /// A `</stream:stream>` close tag ends `end` bytes into the slice.
+    StreamClose(usize),
+}
+
 pub struct XmlFramer
 {
-    buffer: String,
+    // Raw bytes are buffered (rather than a lossily-decoded `String`) so that
+    // multi-byte UTF-8 characters split across TCP reads are not corrupted.
+    // Decoding to text only happens once a complete frame has been carved out.
+    buffer: Vec<u8>,
+    // Offset of the first unconsumed byte. Consumed frames are not physically
+    // removed on every extraction (which would be O(n) each time, O(n²) when
+    // many stanzas are buffered); the prefix is reclaimed lazily by `compact`.
+    start: usize,
     stream_opened: bool,
 }
 
@@ -8,23 +36,59 @@ impl XmlFramer
 {
     pub fn new() -> Self
     {
-        return Self { buffer: String::new(), stream_opened: false };
+        return Self { buffer: Vec::new(), start: 0, stream_opened: false };
     }
 
     pub fn new_opened() -> Self
     {
-        return Self { buffer: String::new(), stream_opened: true };
+        return Self { buffer: Vec::new(), start: 0, stream_opened: true };
     }
 
     pub fn feed(&mut self, data: &[u8])
     {
-        self.buffer.push_str(&String::from_utf8_lossy(data));
+        self.buffer.extend_from_slice(data);
     }
 
     pub fn reset(&mut self)
     {
         self.buffer.clear();
+        self.start = 0;
         self.stream_opened = false;
+    }
+
+    /// The unconsumed portion of the buffer.
+    fn active(&self) -> &[u8]
+    {
+        return &self.buffer[self.start..];
+    }
+
+    /// Consume `n` bytes from the front of the active region, returning them
+    /// decoded as a string. A complete frame is delimited by ASCII `<`/`>`, so
+    /// any multi-byte characters inside it are whole by construction.
+    fn advance(&mut self, n: usize) -> String
+    {
+        let end = self.start + n;
+        let frame = String::from_utf8_lossy(&self.buffer[self.start..end]).into_owned();
+        self.start = end;
+        self.compact();
+
+        return frame;
+    }
+
+    /// Reclaim the consumed prefix once it dominates the buffer. This keeps the
+    /// amortised cost of consuming a frame O(1) while bounding memory use.
+    fn compact(&mut self)
+    {
+        if self.start == self.buffer.len()
+        {
+            self.buffer.clear();
+            self.start = 0;
+        }
+        else if self.start >= self.buffer.len() / 2
+        {
+            self.buffer.drain(..self.start);
+            self.start = 0;
+        }
     }
 
     /// Try to extract the next frame from the buffer.
@@ -33,264 +97,243 @@ impl XmlFramer
     pub fn try_next(&mut self) -> Option<String>
     {
         self.skip_whitespace();
-        if self.buffer.is_empty()
+        if self.active().is_empty()
         {
             return None;
         }
 
         if !self.stream_opened
         {
-            self.try_stream_header()
+            let end = scan_stream_header(self.active())?;
+            self.stream_opened = true;
+            return Some(self.advance(end));
         }
-        else
+
+        match scan_stanza(self.active())?
         {
-            self.try_stanza()
+            StanzaEnd::Frame(end) => Some(self.advance(end)),
+            StanzaEnd::StreamClose(end) =>
+            {
+                self.stream_opened = false;
+                Some(self.advance(end))
+            }
         }
     }
 
     fn skip_whitespace(&mut self)
     {
-        let trimmed = self.buffer.trim_start();
-        let ws_len = self.buffer.len() - trimmed.len();
+        let ws_len = self.active().iter().take_while(|b| b.is_ascii_whitespace()).count();
+        self.start += ws_len;
+    }
+}
 
-        if ws_len > 0
+/// Scan for a `<stream:stream ...>` header. Returns the byte offset one past
+/// its closing `>`, or `None` if the header is incomplete or absent.
+fn scan_stream_header(buf: &[u8]) -> Option<usize>
+{
+    let len = buf.len();
+    let mut pos = 0;
+
+    // Skip processing instructions (<?xml ...?>)
+    while pos < len
+    {
+        if pos + 1 < len && buf[pos] == b'<' && buf[pos + 1] == b'?'
         {
-            self.buffer = self.buffer[ws_len..].to_string();
+            match find_bytes(&buf[pos..], b"?>")
+            {
+                Some(end) => pos += end + 2,
+                None => return None,
+            }
+            while pos < len && buf[pos].is_ascii_whitespace()
+            {
+                pos += 1;
+            }
+        }
+        else
+        {
+            break;
         }
     }
 
-    fn try_stream_header(&mut self) -> Option<String>
+    if pos >= len
     {
-        let bytes = self.buffer.as_bytes();
-        let len = bytes.len();
-        let mut pos = 0;
-
-        // Skip processing instructions (<?xml ...?>)
-        while pos < len
-        {
-            if pos + 1 < len && bytes[pos] == b'<' && bytes[pos + 1] == b'?'
-            {
-                match self.buffer[pos..].find("?>")
-                {
-                    Some(end) => pos += end + 2,
-                    None => return None,
-                }
-                while pos < len && bytes[pos].is_ascii_whitespace()
-                {
-                    pos += 1;
-                }
-            }
-            else
-            {
-                break;
-            }
-        }
-
-        if pos >= len
-        {
-            return None;
-        }
-
-        if !self.buffer[pos..].starts_with("<stream:stream")
-        {
-            return None;
-        }
-
-        // Find the closing '>' of the opening tag, handling quoted attributes
-        let mut i = pos + 14;
-        let mut in_quote = false;
-        let mut quote_char = b'"';
-
-        while i < len
-        {
-            if in_quote
-            {
-                if bytes[i] == quote_char
-                {
-                    in_quote = false;
-                }
-            }
-            else if bytes[i] == b'"' || bytes[i] == b'\''
-            {
-                in_quote = true;
-                quote_char = bytes[i];
-            }
-            else if bytes[i] == b'>'
-            {
-                let end = i + 1;
-                let header = self.buffer[..end].to_string();
-                self.buffer = self.buffer[end..].to_string();
-                self.stream_opened = true;
-
-                return Some(header);
-            }
-
-            i += 1;
-        }
-
         return None;
     }
 
-    fn try_stanza(&mut self) -> Option<String>
+    if !buf[pos..].starts_with(b"<stream:stream")
     {
-        if self.buffer.is_empty()
+        return None;
+    }
+
+    // Find the closing '>' of the opening tag, handling quoted attributes
+    let mut i = pos + 14;
+    let mut in_quote = false;
+    let mut quote_char = b'"';
+
+    while i < len
+    {
+        if in_quote
+        {
+            if buf[i] == quote_char
+            {
+                in_quote = false;
+            }
+        }
+        else if buf[i] == b'"' || buf[i] == b'\''
+        {
+            in_quote = true;
+            quote_char = buf[i];
+        }
+        else if buf[i] == b'>'
+        {
+            return Some(i + 1);
+        }
+
+        i += 1;
+    }
+
+    return None;
+}
+
+/// Scan for one complete top-level stanza (or a stream close tag). Returns
+/// `None` if the buffer does not yet hold a complete element.
+fn scan_stanza(buf: &[u8]) -> Option<StanzaEnd>
+{
+    if buf.is_empty()
+    {
+        return None;
+    }
+
+    // Check for stream close
+    if buf.starts_with(b"</stream:stream")
+    {
+        return find_bytes(buf, b">").map(|end| StanzaEnd::StreamClose(end + 1));
+    }
+
+    let len = buf.len();
+    let mut i = 0;
+    let mut depth = 0i32;
+
+    while i < len
+    {
+        if buf[i] != b'<'
+        {
+            i += 1;
+            continue;
+        }
+
+        if i + 1 >= len
         {
             return None;
         }
 
-        // Check for stream close
-        if self.buffer.starts_with("</stream:stream")
+        if buf[i + 1] == b'/'
         {
-            match self.buffer.find('>')
+            // Closing tag
+            match find_bytes(&buf[i..], b">")
             {
                 Some(end) =>
                 {
-                    let frame = self.buffer[..end + 1].to_string();
-                    self.buffer = self.buffer[end + 1..].to_string();
-                    self.stream_opened = false;
-
-                    return Some(frame);
+                    depth -= 1;
+                    i += end + 1;
+                    if depth == 0
+                    {
+                        return Some(StanzaEnd::Frame(i));
+                    }
                 }
                 None => return None,
             }
         }
-
-        let bytes = self.buffer.as_bytes();
-        let len = bytes.len();
-        let mut i = 0;
-        let mut depth = 0i32;
-
-        while i < len
+        else if buf[i + 1] == b'?'
         {
-            if bytes[i] != b'<'
+            // Processing instruction
+            match find_bytes(&buf[i..], b"?>")
             {
-                i += 1;
-                continue;
+                Some(end) => i += end + 2,
+                None => return None,
             }
-
-            if i + 1 >= len
+        }
+        else if buf[i + 1] == b'!'
+        {
+            // Comment or CDATA
+            if buf[i..].starts_with(b"<!--")
             {
-                return None;
-            }
-
-            if bytes[i + 1] == b'/'
-            {
-                // Closing tag
-                match self.buffer[i..].find('>')
+                match find_bytes(&buf[i..], b"-->")
                 {
-                    Some(end) =>
-                    {
-                        depth -= 1;
-                        i += end + 1;
-                        if depth == 0
-                        {
-                            let frame = self.buffer[..i].to_string();
-                            self.buffer = self.buffer[i..].to_string();
-
-                            return Some(frame);
-                        }
-                    }
+                    Some(end) => i += end + 3,
                     None => return None,
                 }
             }
-            else if bytes[i + 1] == b'?'
+            else if buf[i..].starts_with(b"<![CDATA[")
             {
-                // Processing instruction
-                match self.buffer[i..].find("?>")
+                match find_bytes(&buf[i..], b"]]>")
                 {
-                    Some(end) => i += end + 2,
+                    Some(end) => i += end + 3,
                     None => return None,
-                }
-            }
-            else if bytes[i + 1] == b'!'
-            {
-                // Comment or CDATA
-                if self.buffer[i..].starts_with("<!--")
-                {
-                    match self.buffer[i..].find("-->")
-                    {
-                        Some(end) => i += end + 3,
-                        None => return None,
-                    }
-                }
-                else if self.buffer[i..].starts_with("<![CDATA[")
-                {
-                    match self.buffer[i..].find("]]>")
-                    {
-                        Some(end) => i += end + 3,
-                        None => return None,
-                    }
-                }
-                else
-                {
-                    i += 1;
                 }
             }
             else
             {
-                // Opening or self-closing tag
-                let (tag_end, self_closing) = match self.scan_tag(i)
-                {
-                    Some(v) => v,
-                    None => return None,
-                };
-
-                if self_closing
-                {
-                    if depth == 0
-                    {
-                        let frame = self.buffer[..tag_end].to_string();
-                        self.buffer = self.buffer[tag_end..].to_string();
-                        return Some(frame);
-                    }
-
-                    i = tag_end;
-                }
-                else
-                {
-                    depth += 1;
-                    i = tag_end;
-                }
+                i += 1;
             }
         }
-
-        return None;
-    }
-
-    /// Scan a tag starting at `start` (which points to '<').
-    /// Returns (byte position after '>', is_self_closing).
-    fn scan_tag(&self, start: usize) -> Option<(usize, bool)>
-    {
-        let bytes = self.buffer.as_bytes();
-        let len = bytes.len();
-        let mut i = start + 1;
-        let mut in_quote = false;
-        let mut quote_char = b'"';
-
-        while i < len
+        else
         {
-            if in_quote
-            {
-                if bytes[i] == quote_char
-                {
-                    in_quote = false;
-                }
-            }
-            else if bytes[i] == b'"' || bytes[i] == b'\''
-            {
-                in_quote = true;
-                quote_char = bytes[i];
-            }
-            else if bytes[i] == b'>'
-            {
-                let self_closing = i > 0 && bytes[i - 1] == b'/';
-                return Some((i + 1, self_closing));
-            }
-            i += 1;
-        }
+            // Opening or self-closing tag
+            let (tag_end, self_closing) = scan_tag(buf, i)?;
 
-        return None;
+            if self_closing
+            {
+                if depth == 0
+                {
+                    return Some(StanzaEnd::Frame(tag_end));
+                }
+
+                i = tag_end;
+            }
+            else
+            {
+                depth += 1;
+                i = tag_end;
+            }
+        }
     }
+
+    return None;
+}
+
+/// Scan a tag in `buf` starting at `start` (which points to '<').
+/// Returns (byte position after '>', is_self_closing).
+fn scan_tag(buf: &[u8], start: usize) -> Option<(usize, bool)>
+{
+    let len = buf.len();
+    let mut i = start + 1;
+    let mut in_quote = false;
+    let mut quote_char = b'"';
+
+    while i < len
+    {
+        if in_quote
+        {
+            if buf[i] == quote_char
+            {
+                in_quote = false;
+            }
+        }
+        else if buf[i] == b'"' || buf[i] == b'\''
+        {
+            in_quote = true;
+            quote_char = buf[i];
+        }
+        else if buf[i] == b'>'
+        {
+            let self_closing = i > 0 && buf[i - 1] == b'/';
+            return Some((i + 1, self_closing));
+        }
+        i += 1;
+    }
+
+    return None;
 }
 
 #[cfg(test)]
@@ -519,6 +562,24 @@ mod tests
         framer.feed(b"<message><body><![CDATA[<not>xml</not>]]></body></message>");
         let frame = framer.try_next().unwrap();
         assert!(frame.contains("<![CDATA[<not>xml</not>]]>"));
+    }
+
+    #[test]
+    fn multibyte_char_split_across_feeds()
+    {
+        let mut framer = XmlFramer::new();
+        framer.feed(b"<stream:stream from='x' to='y'>");
+        framer.try_next();
+
+        // "héllo 😀" encoded as UTF-8, split mid-character across two feeds.
+        let stanza = "<message><body>héllo 😀</body></message>".as_bytes();
+        let split = 18; // lands in the middle of the multi-byte 'é'
+        framer.feed(&stanza[..split]);
+        assert!(framer.try_next().is_none());
+        framer.feed(&stanza[split..]);
+
+        let frame = framer.try_next().unwrap();
+        assert_eq!(frame, "<message><body>héllo 😀</body></message>");
     }
 
     #[test]

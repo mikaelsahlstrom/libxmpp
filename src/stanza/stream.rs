@@ -64,7 +64,8 @@ impl Stanza for Stream
     {
         format!(
             r#"<?xml version='1.0'?><stream:stream from='{}' to='{}' version='1.0' xml:lang='en' xmlns='jabber:client' xmlns:stream='http://etherx.jabber.org/streams'>"#,
-            self.from, self.to
+            quick_xml::escape::escape(&self.from),
+            quick_xml::escape::escape(&self.to)
         )
     }
 }

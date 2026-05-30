@@ -27,7 +27,7 @@ impl Stanza for MucGroupMessage
     {
         format!(
             "<message type='groupchat' to='{}'><body>{}</body></message>",
-            self.to,
+            quick_xml::escape::escape(&self.to),
             quick_xml::escape::escape(&self.body)
         )
     }
@@ -47,7 +47,8 @@ impl Stanza for MucJoinPresence
     {
         format!(
             "<presence to='{}/{}'><x xmlns='http://jabber.org/protocol/muc'/></presence>",
-            self.room_jid, self.nick
+            quick_xml::escape::escape(&self.room_jid),
+            quick_xml::escape::escape(&self.nick)
         )
     }
 }
@@ -72,7 +73,8 @@ impl Stanza for MucLeavePresence
     {
         format!(
             "<presence type='unavailable' to='{}/{}'/>",
-            self.room_jid, self.nick
+            quick_xml::escape::escape(&self.room_jid),
+            quick_xml::escape::escape(&self.nick)
         )
     }
 }

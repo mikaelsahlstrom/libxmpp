@@ -23,11 +23,12 @@ impl Stanza for BindRequest
         {
             Some(res) => format!(
                 "<iq type='set' id='{}'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'><resource>{}</resource></bind></iq>",
-                self.id, res
+                quick_xml::escape::escape(&self.id),
+                quick_xml::escape::escape(res)
             ),
             None => format!(
                 "<iq type='set' id='{}'><bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/></iq>",
-                self.id
+                quick_xml::escape::escape(&self.id)
             ),
         }
     }
