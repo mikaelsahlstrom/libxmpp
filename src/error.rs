@@ -27,6 +27,9 @@ pub enum XmppError
     Parse(String),
     /// The peer violated the expected protocol flow or connection state.
     Protocol(String),
+    /// A request timed out waiting for the peer's response (e.g. a ping that
+    /// was never answered).
+    Timeout(String),
     /// The connection was closed.
     Disconnected,
 }
@@ -47,6 +50,7 @@ impl std::fmt::Display for XmppError
             XmppError::Bind(s) => write!(f, "resource binding failed: {}", s),
             XmppError::Parse(s) => write!(f, "parse error: {}", s),
             XmppError::Protocol(s) => write!(f, "protocol error: {}", s),
+            XmppError::Timeout(s) => write!(f, "timed out: {}", s),
             XmppError::Disconnected => write!(f, "connection closed"),
         }
     }

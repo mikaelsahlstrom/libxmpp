@@ -13,7 +13,7 @@ name = "xmpp"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1.52.2", features = ["net", "io-util", "rt", "sync", "macros"] }
+tokio = { version = "1.52.2", features = ["net", "io-util", "rt", "sync", "macros", "time"] }
 tokio-rustls = "0.26.4"
 webpki-roots = "1.0.7"
 log = "0.4.29"

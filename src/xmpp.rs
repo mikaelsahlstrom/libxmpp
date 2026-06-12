@@ -1,6 +1,8 @@
 use tokio::sync::mpsc;
 use std::collections::{HashMap, HashSet};
 
+use crate::PendingIqs;
+
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
@@ -272,9 +274,10 @@ async fn do_bind(
 }
 
 /// Inspect only the root element of a stanza, returning its local name and the
-/// value of its `type` attribute. Dispatch is driven by this parsed view rather
-/// than substring matching, so body text can never be mistaken for markup.
-fn peek_root(xml: &str) -> Option<(String, Option<String>)>
+/// values of its `type` and `id` attributes. Dispatch is driven by this parsed
+/// view rather than substring matching, so body text can never be mistaken for
+/// markup.
+fn peek_root(xml: &str) -> Option<(String, Option<String>, Option<String>)>
 {
     let mut reader = Reader::from_str(xml);
 
@@ -288,15 +291,18 @@ fn peek_root(xml: &str) -> Option<(String, Option<String>)>
                 let name = std::str::from_utf8(local.as_ref()).ok()?.to_string();
 
                 let mut stanza_type = None;
+                let mut id = None;
                 for attr in e.attributes().flatten()
                 {
-                    if attr.key.local_name().as_ref() == b"type"
+                    match attr.key.local_name().as_ref()
                     {
-                        stanza_type = attr.unescape_value().ok().map(|v| v.to_string());
+                        b"type" => stanza_type = attr.unescape_value().ok().map(|v| v.to_string()),
+                        b"id" => id = attr.unescape_value().ok().map(|v| v.to_string()),
+                        _ => {}
                     }
                 }
 
-                return Some((name, stanza_type));
+                return Some((name, stanza_type, id));
             }
             Ok(Event::Eof) | Err(_) => return None,
             _ => {}
@@ -310,9 +316,10 @@ pub async fn process_stanza(
     pending_joins: &mut HashMap<String, Vec<RoomMember>>,
     pending_messages: &mut HashMap<String, Vec<XmppEvent>>,
     joined_rooms: &mut HashSet<String>,
+    pending_iqs: &PendingIqs,
 )
 {
-    let (root, stanza_type) = match peek_root(xml)
+    let (root, stanza_type, id) = match peek_root(xml)
     {
         Some(v) => v,
         None => return,
@@ -335,6 +342,18 @@ pub async fn process_stanza(
         ("message", Some("groupchat")) =>
         {
             process_groupchat_message(xml, event_tx, pending_joins, pending_messages, joined_rooms).await;
+        }
+        ("iq", Some("result")) | ("iq", Some("error")) =>
+        {
+            // Wake any caller awaiting this IQ's reply. Both a result and an
+            // error count as a reply: either proves the peer is reachable.
+            if let Some(id) = id
+            {
+                if let Some(tx) = pending_iqs.lock().unwrap().remove(&id)
+                {
+                    let _ = tx.send(());
+                }
+            }
         }
         _ => {}
     }
@@ -578,7 +597,7 @@ mod tests
     #[test]
     fn peek_root_reads_name_and_type()
     {
-        let (name, typ) = peek_root("<message type='chat' from='a@b'><body>hi</body></message>").unwrap();
+        let (name, typ, _id) = peek_root("<message type='chat' from='a@b'><body>hi</body></message>").unwrap();
         assert_eq!(name, "message");
         assert_eq!(typ.as_deref(), Some("chat"));
     }
@@ -588,7 +607,7 @@ mod tests
     {
         // A body that contains markup-like text must not change the dispatch:
         // the root element is still a type='chat' message.
-        let (name, typ) = peek_root(
+        let (name, typ, _id) = peek_root(
             "<message type='chat' from='a@b'><body>look: type='groupchat'</body></message>"
         ).unwrap();
         assert_eq!(name, "message");
@@ -598,8 +617,42 @@ mod tests
     #[test]
     fn peek_root_handles_self_closing()
     {
-        let (name, typ) = peek_root("<presence type='unavailable'/>").unwrap();
+        let (name, typ, _id) = peek_root("<presence type='unavailable'/>").unwrap();
         assert_eq!(name, "presence");
         assert_eq!(typ.as_deref(), Some("unavailable"));
+    }
+
+    #[test]
+    fn peek_root_reads_iq_id()
+    {
+        let (name, typ, id) = peek_root("<iq type='result' id='ping_1'/>").unwrap();
+        assert_eq!(name, "iq");
+        assert_eq!(typ.as_deref(), Some("result"));
+        assert_eq!(id.as_deref(), Some("ping_1"));
+    }
+
+    #[tokio::test]
+    async fn iq_result_wakes_pending_caller()
+    {
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let mut pending_joins = HashMap::new();
+        let mut pending_messages = HashMap::new();
+        let mut joined_rooms = HashSet::new();
+
+        let pending_iqs: PendingIqs = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        pending_iqs.lock().unwrap().insert("ping_1".to_string(), tx);
+
+        process_stanza(
+            "<iq type='result' id='ping_1'/>",
+            &event_tx,
+            &mut pending_joins,
+            &mut pending_messages,
+            &mut joined_rooms,
+            &pending_iqs,
+        ).await;
+
+        assert!(rx.await.is_ok());
+        assert!(pending_iqs.lock().unwrap().is_empty());
     }
 }
