@@ -3,6 +3,7 @@ pub mod sasl;
 pub mod bind;
 pub mod muc;
 pub mod chat;
+pub mod ping;
 
 pub trait Stanza
 {

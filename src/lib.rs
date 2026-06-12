@@ -2,9 +2,11 @@
 //!
 //! It currently supports connecting to an XMPP server with STARTTLS and
 //! SASL authentication, joining and leaving Multi-User Chat (MUC) rooms,
-//! sending and receiving group messages, and exchanging one-to-one chat
-//! messages. Server events are delivered as [`XmppEvent`] values on an
-//! [`mpsc::Receiver`] returned from [`XmppClient::new`].
+//! sending and receiving group messages, exchanging one-to-one chat
+//! messages, and sending XEP-0199 pings to keep the connection alive or
+//! probe whether it is still usable. Server events are delivered as
+//! [`XmppEvent`] values on an [`mpsc::Receiver`] returned from
+//! [`XmppClient::new`].
 //!
 //! # Example
 //!
@@ -40,9 +42,11 @@
 
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 mod error;
 mod tcp_stream;
@@ -53,6 +57,15 @@ mod xmpp;
 pub use error::XmppError;
 use stanza::Stanza;
 use xml_framer::XmlFramer;
+
+/// Registry of in-flight IQ requests awaiting a reply, keyed by stanza `id`.
+///
+/// A caller (e.g. [`XmppClient::ping`]) inserts a [`oneshot::Sender`] before
+/// sending its request; the background reader task removes and fires it when
+/// the matching `<iq type='result'>` or `<iq type='error'>` arrives. The lock
+/// is only ever held for the brief, non-async insert/remove, so a
+/// [`std::sync::Mutex`] is sufficient.
+pub(crate) type PendingIqs = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
 
 /// An event emitted by an [`XmppClient`] over its event channel.
 ///
@@ -135,6 +148,8 @@ pub struct XmppClient
     task: JoinHandle<()>,
     writer: tcp_stream::TcpWriter,
     bound_jid: String,
+    pending_iqs: PendingIqs,
+    next_ping_id: u64,
 }
 
 impl XmppClient
@@ -176,6 +191,9 @@ impl XmppClient
         let shutdown_clone = shutdown.clone();
         let event_tx_loop = event_tx.clone();
 
+        let pending_iqs: PendingIqs = Arc::new(Mutex::new(HashMap::new()));
+        let pending_iqs_loop = pending_iqs.clone();
+
         let task = tokio::spawn(async move
         {
             let mut framer = XmlFramer::new_opened();
@@ -189,7 +207,7 @@ impl XmppClient
                 while let Some(stanza_xml) = framer.try_next()
                 {
                     log::debug!("Received stanza: {}", stanza_xml);
-                    xmpp::process_stanza(&stanza_xml, &event_tx_loop, &mut pending_joins, &mut pending_messages, &mut joined_rooms).await;
+                    xmpp::process_stanza(&stanza_xml, &event_tx_loop, &mut pending_joins, &mut pending_messages, &mut joined_rooms, &pending_iqs_loop).await;
                 }
 
                 // Collect data.
@@ -220,7 +238,7 @@ impl XmppClient
 
         let _ = event_tx.send(XmppEvent::Connected).await;
 
-        return Ok((Self { shutdown, task, writer, bound_jid }, event_rx));
+        return Ok((Self { shutdown, task, writer, bound_jid, pending_iqs, next_ping_id: 0 }, event_rx));
     }
 
     /// Return the full JID assigned to this session by the server,
@@ -271,6 +289,50 @@ impl XmppClient
     {
         let msg = stanza::chat::ChatMessage::new(to.to_string(), body.to_string());
         return self.writer.write(&msg.as_bytes()).await;
+    }
+
+    /// Send an [XEP-0199](https://xmpp.org/extensions/xep-0199.html) ping and
+    /// wait for the reply, returning the round-trip time.
+    ///
+    /// When `to` is `None` the ping targets the user's own server, which is the
+    /// usual choice for a keep-alive (defeating NAT/proxy idle timeouts) or for
+    /// probing whether the connection is still usable. Pass `Some(jid)` to ping
+    /// another entity instead.
+    ///
+    /// Any reply resolves the call successfully, including an error such as
+    /// `service-unavailable`: a reply of any kind proves the peer is reachable.
+    /// Returns [`XmppError::Timeout`] if no reply arrives within `timeout`, or
+    /// [`XmppError::Disconnected`] if the connection drops while waiting.
+    pub async fn ping(&mut self, to: Option<&str>, timeout: Duration) -> Result<Duration, XmppError>
+    {
+        self.next_ping_id += 1;
+        let id = format!("ping_{}", self.next_ping_id);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending_iqs.lock().unwrap().insert(id.clone(), tx);
+
+        let request = stanza::ping::PingRequest::new(id.clone(), to.map(|s| s.to_string()));
+        let start = std::time::Instant::now();
+
+        if let Err(e) = self.writer.write(&request.as_bytes()).await
+        {
+            self.pending_iqs.lock().unwrap().remove(&id);
+            return Err(e);
+        }
+
+        match tokio::time::timeout(timeout, rx).await
+        {
+            // Reply arrived (result or error); the connection is alive.
+            Ok(Ok(())) => return Ok(start.elapsed()),
+            // Sender dropped: the reader task ended, so the connection is gone.
+            Ok(Err(_)) => return Err(XmppError::Disconnected),
+            // No reply within the deadline; drop the pending entry.
+            Err(_) =>
+            {
+                self.pending_iqs.lock().unwrap().remove(&id);
+                return Err(XmppError::Timeout(format!("no ping reply for id {}", id)));
+            }
+        }
     }
 
     /// Shut down the client.

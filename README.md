@@ -10,6 +10,7 @@ An async XMPP client library for Rust, built on Tokio.
 - One-to-one chat messages
 - Multi-User Chat (MUC) rooms: join, leave, send and receive group messages
 - Presence updates and presence-error reporting
+- XEP-0199 ping for keep-alives and connection liveness probing
 
 ## Public API
 
@@ -33,6 +34,7 @@ The crate exposes three top-level items:
 | `leave_room(room_jid, nick)` | Leave a MUC room. |
 | `send_room_message(room_jid, body)` | Send a group chat message. |
 | `send_message(to, body)` | Send a one-to-one chat message. |
+| `ping(to, timeout)` | Send an XEP-0199 ping and await the reply, returning the round-trip time. `to = None` pings the user's own server. |
 | `close()` | Shut down the reader task and close the socket. |
 
 See the rustdoc on `src/lib.rs` for detailed documentation of each
