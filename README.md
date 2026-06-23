@@ -11,10 +11,11 @@ An async XMPP client library for Rust, built on Tokio.
 - Multi-User Chat (MUC) rooms: join, leave, send and receive group messages
 - Presence updates and presence-error reporting
 - XEP-0199 ping for keep-alives and connection liveness probing
+- XEP-0030 service discovery (info and items queries)
 
 ## Public API
 
-The crate exposes three top-level items:
+The crate exposes these top-level items:
 
 - [`XmppClient`](src/lib.rs) — the client handle. Created with
   `XmppClient::new(jid, password).await`, which returns the client
@@ -23,6 +24,9 @@ The crate exposes three top-level items:
   (connection lifecycle, room joins/leaves, messages, presence
   errors).
 - [`RoomMember`](src/lib.rs) — describes an occupant of a MUC room.
+- [`DiscoInfo`](src/lib.rs), [`DiscoIdentity`](src/lib.rs) and
+  [`DiscoItem`](src/lib.rs) — the results of XEP-0030 service
+  discovery queries.
 
 `XmppClient` provides:
 
@@ -35,6 +39,8 @@ The crate exposes three top-level items:
 | `send_room_message(room_jid, body)` | Send a group chat message. |
 | `send_message(to, body)` | Send a one-to-one chat message. |
 | `ping(to, timeout)` | Send an XEP-0199 ping and await the reply, returning the round-trip time. `to = None` pings the user's own server. |
+| `disco_info(to, node, timeout)` | Send an XEP-0030 service discovery info query, returning the entity's advertised identities and features. |
+| `disco_items(to, node, timeout)` | Send an XEP-0030 service discovery items query, returning the items the entity hosts. |
 | `close()` | Shut down the reader task and close the socket. |
 
 See the rustdoc on `src/lib.rs` for detailed documentation of each

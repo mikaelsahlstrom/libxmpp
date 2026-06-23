@@ -345,13 +345,14 @@ pub async fn process_stanza(
         }
         ("iq", Some("result")) | ("iq", Some("error")) =>
         {
-            // Wake any caller awaiting this IQ's reply. Both a result and an
-            // error count as a reply: either proves the peer is reachable.
+            // Wake any caller awaiting this IQ's reply, handing over the raw
+            // reply stanza so it can parse the response body. Both a result and
+            // an error count as a reply: either proves the peer is reachable.
             if let Some(id) = id
             {
                 if let Some(tx) = pending_iqs.lock().unwrap().remove(&id)
                 {
-                    let _ = tx.send(());
+                    let _ = tx.send(xml.to_string());
                 }
             }
         }
@@ -652,7 +653,8 @@ mod tests
             &pending_iqs,
         ).await;
 
-        assert!(rx.await.is_ok());
+        // The caller receives the raw reply stanza so it can parse any payload.
+        assert_eq!(rx.await.unwrap(), "<iq type='result' id='ping_1'/>");
         assert!(pending_iqs.lock().unwrap().is_empty());
     }
 }
