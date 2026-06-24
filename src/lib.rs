@@ -4,9 +4,10 @@
 //! SASL authentication, joining and leaving Multi-User Chat (MUC) rooms,
 //! sending and receiving group messages, exchanging one-to-one chat
 //! messages, sending XEP-0199 pings to keep the connection alive or
-//! probe whether it is still usable, and performing XEP-0030 service
-//! discovery to learn the identities, features, and hosted items of
-//! remote entities. Server events are delivered as
+//! probe whether it is still usable (and answering pings from others),
+//! and performing XEP-0030 service discovery to learn the identities,
+//! features, and hosted items of remote entities as well as answering
+//! such queries from others. Server events are delivered as
 //! [`XmppEvent`] values on an [`mpsc::Receiver`] returned from
 //! [`XmppClient::new`].
 //!
@@ -198,6 +199,58 @@ fn iq_error(query: &str, iq_type: &str) -> XmppError
     return XmppError::Protocol(format!("{} query returned iq type '{}'", query, iq_type));
 }
 
+/// The identities, features, and items this client advertises when answering
+/// incoming XEP-0030 service discovery queries from other entities.
+///
+/// Held behind a [`Mutex`] so it can be reconfigured at runtime (e.g. with
+/// [`XmppClient::set_disco_info`]) while the background reader task reads it to
+/// build replies.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalDisco
+{
+    pub(crate) info: DiscoInfo,
+    pub(crate) items: Vec<DiscoItem>,
+}
+
+impl Default for LocalDisco
+{
+    fn default() -> Self
+    {
+        // Advertise the one identity and the features we actually answer here:
+        // the two service-discovery namespaces and XEP-0199 ping. Callers can
+        // replace these via the `set_disco_*` methods on [`XmppClient`].
+        return LocalDisco
+        {
+            info: DiscoInfo
+            {
+                identities: vec![DiscoIdentity
+                {
+                    category: "client".to_string(),
+                    // Default kind to bot. Should be set to a better value
+                    // by the calling client by setting a new [`DiscoInfo`].
+                    kind: "bot".to_string(),
+                    name: Some("libxmpp".to_string()),
+                }],
+                features: vec![
+                    "http://jabber.org/protocol/disco#info".to_string(),
+                    "http://jabber.org/protocol/disco#items".to_string(),
+                    "urn:xmpp:ping".to_string(),
+                ],
+            },
+            items: Vec::new(),
+        };
+    }
+}
+
+/// Shared handle to the [`LocalDisco`] advertised by a client. Cloned into the
+/// background reader task so it can answer incoming queries.
+pub(crate) type LocalDiscoState = Arc<Mutex<LocalDisco>>;
+
+/// Shared handle to the connection's write half. Both the public client methods
+/// and the background reader task (when auto-replying to incoming IQs) send
+/// through it, so it is guarded by an async [`tokio::sync::Mutex`].
+pub(crate) type SharedWriter = Arc<tokio::sync::Mutex<tcp_stream::TcpWriter>>;
+
 /// An asynchronous XMPP client.
 ///
 /// An `XmppClient` owns the TCP/TLS connection, the background reader
@@ -209,10 +262,11 @@ pub struct XmppClient
 {
     shutdown: Arc<Notify>,
     task: JoinHandle<()>,
-    writer: tcp_stream::TcpWriter,
+    writer: SharedWriter,
     bound_jid: String,
     pending_iqs: PendingIqs,
     next_iq_id: u64,
+    local_disco: LocalDiscoState,
 }
 
 impl XmppClient
@@ -250,12 +304,22 @@ impl XmppClient
         // Broadcast initial available presence so the server routes
         // incoming directed messages (e.g. one-to-one chats) to this resource.
         writer.write(b"<presence/>").await?;
+
+        // Share the write half with the reader task so it can auto-reply to
+        // incoming IQ queries (e.g. service discovery) without round-tripping
+        // through the owning client.
+        let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(writer));
+        let writer_loop = writer.clone();
+
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
         let event_tx_loop = event_tx.clone();
 
         let pending_iqs: PendingIqs = Arc::new(Mutex::new(HashMap::new()));
         let pending_iqs_loop = pending_iqs.clone();
+
+        let local_disco: LocalDiscoState = Arc::new(Mutex::new(LocalDisco::default()));
+        let local_disco_loop = local_disco.clone();
 
         let task = tokio::spawn(async move
         {
@@ -270,7 +334,7 @@ impl XmppClient
                 while let Some(stanza_xml) = framer.try_next()
                 {
                     log::debug!("Received stanza: {}", stanza_xml);
-                    xmpp::process_stanza(&stanza_xml, &event_tx_loop, &mut pending_joins, &mut pending_messages, &mut joined_rooms, &pending_iqs_loop).await;
+                    xmpp::process_stanza(&stanza_xml, &event_tx_loop, &mut pending_joins, &mut pending_messages, &mut joined_rooms, &pending_iqs_loop, &writer_loop, &local_disco_loop).await;
                 }
 
                 // Collect data.
@@ -301,7 +365,7 @@ impl XmppClient
 
         let _ = event_tx.send(XmppEvent::Connected).await;
 
-        return Ok((Self { shutdown, task, writer, bound_jid, pending_iqs, next_iq_id: 0 }, event_rx));
+        return Ok((Self { shutdown, task, writer, bound_jid, pending_iqs, next_iq_id: 0, local_disco }, event_rx));
     }
 
     /// Return the full JID assigned to this session by the server,
@@ -321,7 +385,7 @@ impl XmppClient
     pub async fn join_room(&mut self, room_jid: &str, nick: &str) -> Result<(), XmppError>
     {
         let presence = stanza::muc::MucJoinPresence::new(room_jid.to_string(), nick.to_string());
-        return self.writer.write(&presence.as_bytes()).await;
+        return self.writer.lock().await.write(&presence.as_bytes()).await;
     }
 
     /// Leave a MUC room previously joined as `nick`.
@@ -331,7 +395,7 @@ impl XmppClient
     pub async fn leave_room(&mut self, room_jid: &str, nick: &str) -> Result<(), XmppError>
     {
         let presence = stanza::muc::MucLeavePresence::new(room_jid.to_string(), nick.to_string());
-        return self.writer.write(&presence.as_bytes()).await;
+        return self.writer.lock().await.write(&presence.as_bytes()).await;
     }
 
     /// Send a group chat message to a MUC room.
@@ -341,7 +405,7 @@ impl XmppClient
     pub async fn send_room_message(&mut self, room_jid: &str, body: &str) -> Result<(), XmppError>
     {
         let msg = stanza::muc::MucGroupMessage::new(room_jid.to_string(), body.to_string());
-        return self.writer.write(&msg.as_bytes()).await;
+        return self.writer.lock().await.write(&msg.as_bytes()).await;
     }
 
     /// Send a one-to-one chat message.
@@ -351,7 +415,7 @@ impl XmppClient
     pub async fn send_message(&mut self, to: &str, body: &str) -> Result<(), XmppError>
     {
         let msg = stanza::chat::ChatMessage::new(to.to_string(), body.to_string());
-        return self.writer.write(&msg.as_bytes()).await;
+        return self.writer.lock().await.write(&msg.as_bytes()).await;
     }
 
     /// Send an [XEP-0199](https://xmpp.org/extensions/xep-0199.html) ping and
@@ -463,6 +527,44 @@ impl XmppClient
         return Ok(items);
     }
 
+    /// Replace the identities and features this client advertises when it
+    /// answers an incoming [XEP-0030](https://xmpp.org/extensions/xep-0030.html)
+    /// service discovery **info** query.
+    ///
+    /// By default a client advertises a single `client`/`bot` identity named
+    /// `libxmpp` and the two service-discovery features it answers. Call this to
+    /// present a different identity or to advertise additional features the
+    /// surrounding application supports (using [`add_disco_feature`] for the
+    /// latter is usually more convenient). Takes effect for queries received
+    /// after it returns.
+    ///
+    /// [`add_disco_feature`]: Self::add_disco_feature
+    pub fn set_disco_info(&self, info: DiscoInfo)
+    {
+        self.local_disco.lock().unwrap().info = info;
+    }
+
+    /// Advertise an additional feature namespace (e.g.
+    /// `http://jabber.org/protocol/muc`) in replies to service discovery info
+    /// queries. A namespace already advertised is not added again.
+    pub fn add_disco_feature(&self, var: &str)
+    {
+        let mut disco = self.local_disco.lock().unwrap();
+        if !disco.info.features.iter().any(|f| f == var)
+        {
+            disco.info.features.push(var.to_string());
+        }
+    }
+
+    /// Replace the items this client advertises when it answers an incoming
+    /// service discovery **items** query.
+    ///
+    /// A plain client hosts nothing and so advertises an empty list by default.
+    pub fn set_disco_items(&self, items: Vec<DiscoItem>)
+    {
+        self.local_disco.lock().unwrap().items = items;
+    }
+
     /// Allocate the next unique IQ stanza `id`, tagged with `prefix` so it is
     /// recognisable in logs (e.g. `ping_3`, `disco_7`).
     fn next_iq_id(&mut self, prefix: &str) -> String
@@ -482,7 +584,7 @@ impl XmppClient
         let (tx, rx) = oneshot::channel();
         self.pending_iqs.lock().unwrap().insert(id.to_string(), tx);
 
-        if let Err(e) = self.writer.write(&request.as_bytes()).await
+        if let Err(e) = self.writer.lock().await.write(&request.as_bytes()).await
         {
             self.pending_iqs.lock().unwrap().remove(id);
             return Err(e);
@@ -512,6 +614,6 @@ impl XmppClient
     {
         self.shutdown.notify_one();
         let _ = self.task.await;
-        self.writer.shutdown().await;
+        self.writer.lock().await.shutdown().await;
     }
 }

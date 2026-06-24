@@ -1,8 +1,9 @@
 use super::Stanza;
+use crate::{DiscoInfo, DiscoItem};
 use serde::Deserialize;
 
-const DISCO_INFO_NS: &str = "http://jabber.org/protocol/disco#info";
-const DISCO_ITEMS_NS: &str = "http://jabber.org/protocol/disco#items";
+pub(crate) const DISCO_INFO_NS: &str = "http://jabber.org/protocol/disco#info";
+pub(crate) const DISCO_ITEMS_NS: &str = "http://jabber.org/protocol/disco#items";
 
 /// An outgoing XEP-0030 service discovery **info** query.
 ///
@@ -190,10 +191,179 @@ impl DiscoItemsResult
     }
 }
 
+/// A parsed incoming XEP-0030 service discovery query (`<iq type='get'>`).
+///
+/// A remote entity sends one to learn what this client is and what it
+/// supports. `query.xmlns` distinguishes an **info** query
+/// (`http://jabber.org/protocol/disco#info`) from an **items** query
+/// (`http://jabber.org/protocol/disco#items`); `from` and `id` are echoed back
+/// in the reply so the server routes it to the asker and the asker can match it
+/// to the request.
+#[derive(Deserialize, Debug)]
+#[serde(rename = "iq")]
+pub struct IncomingDiscoQuery
+{
+    #[serde(rename = "@from", default)]
+    pub from: Option<String>,
+    #[serde(rename = "@id", default)]
+    pub id: Option<String>,
+    pub query: IncomingQuery,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct IncomingQuery
+{
+    #[serde(rename = "@xmlns")]
+    pub xmlns: String,
+    #[serde(rename = "@node", default)]
+    pub node: Option<String>,
+}
+
+impl IncomingDiscoQuery
+{
+    pub fn from_xml(xml: &str) -> Result<Self, String>
+    {
+        return quick_xml::de::from_str(xml).map_err(|e| e.to_string());
+    }
+}
+
+/// An outgoing reply to a service discovery **info** query, advertising the
+/// identities and features this client supports.
+///
+/// Serialises to `<iq type='result' to='...' id='...'><query
+/// xmlns='http://jabber.org/protocol/disco#info'>...</query></iq>`. `to` and
+/// `id` echo the originating request; an optional `node` is echoed when the
+/// request scoped its query to a node.
+pub struct DiscoInfoResponse
+{
+    id: String,
+    to: String,
+    node: Option<String>,
+    info: DiscoInfo,
+}
+
+impl DiscoInfoResponse
+{
+    pub fn new(id: String, to: String, node: Option<String>, info: DiscoInfo) -> Self
+    {
+        return Self { id, to, node, info };
+    }
+}
+
+impl Stanza for DiscoInfoResponse
+{
+    fn to_xml(&self) -> String
+    {
+        let mut children = String::new();
+        for identity in &self.info.identities
+        {
+            let name_attr = match &identity.name
+            {
+                Some(name) => format!(" name='{}'", quick_xml::escape::escape(name)),
+                None => String::new(),
+            };
+            children.push_str(&format!(
+                "<identity category='{}' type='{}'{}/>",
+                quick_xml::escape::escape(&identity.category),
+                quick_xml::escape::escape(&identity.kind),
+                name_attr
+            ));
+        }
+        for feature in &self.info.features
+        {
+            children.push_str(&format!(
+                "<feature var='{}'/>",
+                quick_xml::escape::escape(feature)
+            ));
+        }
+
+        return format!(
+            "<iq type='result' to='{}' id='{}'>{}</iq>",
+            quick_xml::escape::escape(&self.to),
+            quick_xml::escape::escape(&self.id),
+            query_with_children(DISCO_INFO_NS, &self.node, &children)
+        );
+    }
+}
+
+/// An outgoing reply to a service discovery **items** query, listing the items
+/// this client hosts (empty by default for a plain client).
+///
+/// Serialises to `<iq type='result' to='...' id='...'><query
+/// xmlns='http://jabber.org/protocol/disco#items'>...</query></iq>`.
+pub struct DiscoItemsResponse
+{
+    id: String,
+    to: String,
+    node: Option<String>,
+    items: Vec<DiscoItem>,
+}
+
+impl DiscoItemsResponse
+{
+    pub fn new(id: String, to: String, node: Option<String>, items: Vec<DiscoItem>) -> Self
+    {
+        return Self { id, to, node, items };
+    }
+}
+
+impl Stanza for DiscoItemsResponse
+{
+    fn to_xml(&self) -> String
+    {
+        let mut children = String::new();
+        for item in &self.items
+        {
+            let name_attr = match &item.name
+            {
+                Some(name) => format!(" name='{}'", quick_xml::escape::escape(name)),
+                None => String::new(),
+            };
+            let node_attr = match &item.node
+            {
+                Some(node) => format!(" node='{}'", quick_xml::escape::escape(node)),
+                None => String::new(),
+            };
+            children.push_str(&format!(
+                "<item jid='{}'{}{}/>",
+                quick_xml::escape::escape(&item.jid),
+                name_attr,
+                node_attr
+            ));
+        }
+
+        return format!(
+            "<iq type='result' to='{}' id='{}'>{}</iq>",
+            quick_xml::escape::escape(&self.to),
+            quick_xml::escape::escape(&self.id),
+            query_with_children(DISCO_ITEMS_NS, &self.node, &children)
+        );
+    }
+}
+
+/// Build a `<query>` element for the given namespace, echoing an optional
+/// `node` and wrapping `children`. An empty body collapses to a self-closing
+/// element.
+fn query_with_children(ns: &str, node: &Option<String>, children: &str) -> String
+{
+    let node_attr = match node
+    {
+        Some(node) => format!(" node='{}'", quick_xml::escape::escape(node)),
+        None => String::new(),
+    };
+
+    return match children.is_empty()
+    {
+        true => format!("<query xmlns='{}'{}/>", ns, node_attr),
+        false => format!("<query xmlns='{}'{}>{}</query>", ns, node_attr, children),
+    };
+}
+
 #[cfg(test)]
 mod tests
 {
     use super::*;
+    use crate::DiscoIdentity;
 
     #[test]
     fn outgoing_info_query_to_server()
@@ -292,5 +462,110 @@ mod tests
         assert_eq!(query.items[0].name.as_deref(), Some("Room One"));
         assert_eq!(query.items[1].jid, "room2@conference.example.com");
         assert_eq!(query.items[1].name, None);
+    }
+
+    #[test]
+    fn parse_incoming_info_query()
+    {
+        let xml = "<iq type='get' from='asker@example.com/x' id='req_1'>\
+            <query xmlns='http://jabber.org/protocol/disco#info'/></iq>";
+
+        let query = IncomingDiscoQuery::from_xml(xml).unwrap();
+        assert_eq!(query.from.as_deref(), Some("asker@example.com/x"));
+        assert_eq!(query.id.as_deref(), Some("req_1"));
+        assert_eq!(query.query.xmlns, DISCO_INFO_NS);
+        assert_eq!(query.query.node, None);
+    }
+
+    #[test]
+    fn parse_incoming_items_query_with_node()
+    {
+        let xml = "<iq type='get' from='asker@example.com' id='req_2'>\
+            <query xmlns='http://jabber.org/protocol/disco#items' \
+            node='http://jabber.org/protocol/commands'/></iq>";
+
+        let query = IncomingDiscoQuery::from_xml(xml).unwrap();
+        assert_eq!(query.query.xmlns, DISCO_ITEMS_NS);
+        assert_eq!(query.query.node.as_deref(), Some("http://jabber.org/protocol/commands"));
+    }
+
+    #[test]
+    fn incoming_query_rejects_non_query_iq()
+    {
+        // A ping get carries no <query>, so it must not parse as a disco query.
+        let xml = "<iq type='get' from='a@b' id='p1'><ping xmlns='urn:xmpp:ping'/></iq>";
+        assert!(IncomingDiscoQuery::from_xml(xml).is_err());
+    }
+
+    #[test]
+    fn info_response_to_xml()
+    {
+        let info = DiscoInfo
+        {
+            identities: vec![DiscoIdentity
+            {
+                category: "client".to_string(),
+                kind: "bot".to_string(),
+                name: Some("libxmpp".to_string()),
+            }],
+            features: vec![DISCO_INFO_NS.to_string(), "urn:xmpp:ping".to_string()],
+        };
+        let response = DiscoInfoResponse::new(
+            "req_1".to_string(),
+            "asker@example.com/x".to_string(),
+            None,
+            info,
+        );
+
+        assert_eq!(
+            response.to_xml(),
+            "<iq type='result' to='asker@example.com/x' id='req_1'>\
+             <query xmlns='http://jabber.org/protocol/disco#info'>\
+             <identity category='client' type='bot' name='libxmpp'/>\
+             <feature var='http://jabber.org/protocol/disco#info'/>\
+             <feature var='urn:xmpp:ping'/>\
+             </query></iq>"
+        );
+    }
+
+    #[test]
+    fn empty_items_response_to_xml()
+    {
+        let response = DiscoItemsResponse::new(
+            "req_2".to_string(),
+            "asker@example.com".to_string(),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(
+            response.to_xml(),
+            "<iq type='result' to='asker@example.com' id='req_2'>\
+             <query xmlns='http://jabber.org/protocol/disco#items'/></iq>"
+        );
+    }
+
+    #[test]
+    fn items_response_echoes_node_and_lists_items()
+    {
+        let response = DiscoItemsResponse::new(
+            "req_3".to_string(),
+            "asker@example.com".to_string(),
+            Some("the-node".to_string()),
+            vec![DiscoItem
+            {
+                jid: "room@conference.example.com".to_string(),
+                name: Some("Room".to_string()),
+                node: None,
+            }],
+        );
+
+        assert_eq!(
+            response.to_xml(),
+            "<iq type='result' to='asker@example.com' id='req_3'>\
+             <query xmlns='http://jabber.org/protocol/disco#items' node='the-node'>\
+             <item jid='room@conference.example.com' name='Room'/>\
+             </query></iq>"
+        );
     }
 }
