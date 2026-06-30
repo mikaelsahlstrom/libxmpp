@@ -6,7 +6,7 @@ use crate::PendingIqs;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
-use crate::{XmppEvent, RoomMember};
+use crate::{XmppEvent, RoomMember, LocalDiscoState, SharedWriter};
 use crate::error::XmppError;
 use crate::tcp_stream::Tcp;
 use crate::stanza;
@@ -317,6 +317,8 @@ pub async fn process_stanza(
     pending_messages: &mut HashMap<String, Vec<XmppEvent>>,
     joined_rooms: &mut HashSet<String>,
     pending_iqs: &PendingIqs,
+    writer: &SharedWriter,
+    local_disco: &LocalDiscoState,
 )
 {
     let (root, stanza_type, id) = match peek_root(xml)
@@ -345,18 +347,91 @@ pub async fn process_stanza(
         }
         ("iq", Some("result")) | ("iq", Some("error")) =>
         {
-            // Wake any caller awaiting this IQ's reply. Both a result and an
-            // error count as a reply: either proves the peer is reachable.
+            // Wake any caller awaiting this IQ's reply, handing over the raw
+            // reply stanza so it can parse the response body. Both a result and
+            // an error count as a reply: either proves the peer is reachable.
             if let Some(id) = id
             {
                 if let Some(tx) = pending_iqs.lock().unwrap().remove(&id)
                 {
-                    let _ = tx.send(());
+                    let _ = tx.send(xml.to_string());
                 }
             }
         }
+        ("iq", Some("get")) =>
+        {
+            // Another entity is querying us; answer the ones we understand
+            // (XEP-0030 service discovery). Unhandled gets are ignored.
+            process_iq_get(xml, writer, local_disco).await;
+        }
         _ => {}
     }
+}
+
+/// Answer an incoming `<iq type='get'>`. XEP-0199 pings and XEP-0030 service
+/// discovery queries are handled; anything else is ignored.
+async fn process_iq_get(
+    xml: &str,
+    writer: &SharedWriter,
+    local_disco: &LocalDiscoState,
+)
+{
+    let response_xml = match build_iq_get_reply(xml, local_disco)
+    {
+        Some(reply) => reply,
+        None => return,
+    };
+
+    if let Err(e) = writer.lock().await.write(response_xml.as_bytes()).await
+    {
+        log::warn!("Failed to reply to incoming iq get: {}", e);
+    }
+}
+
+/// Build the reply to an incoming `<iq type='get'>`, or `None` if it is a kind
+/// we do not answer (or lacks the `from`/`id` needed to reply).
+///
+/// Kept synchronous and separate from the socket write so the disco state lock
+/// is never held across an await, and so the routing is unit-testable without a
+/// connection.
+fn build_iq_get_reply(xml: &str, local_disco: &LocalDiscoState) -> Option<String>
+{
+    // XEP-0199 ping: acknowledge with an empty result.
+    if let Ok(ping) = stanza::ping::IncomingPing::from_xml(xml)
+    {
+        if ping.ping.xmlns == stanza::ping::PING_NS
+        {
+            let to = ping.from?;
+            let id = ping.id?;
+            return Some(stanza::ping::PongResponse::new(id, to).to_xml());
+        }
+    }
+
+    // XEP-0030 service discovery: advertise our identities, features, or items.
+    if let Ok(query) = stanza::disco::IncomingDiscoQuery::from_xml(xml)
+    {
+        let to = query.from?;
+        let id = query.id?;
+        let node = query.query.node;
+
+        return match query.query.xmlns.as_str()
+        {
+            stanza::disco::DISCO_INFO_NS =>
+            {
+                let info = local_disco.lock().unwrap().info.clone();
+                Some(stanza::disco::DiscoInfoResponse::new(id, to, node, info).to_xml())
+            }
+            stanza::disco::DISCO_ITEMS_NS =>
+            {
+                let items = local_disco.lock().unwrap().items.clone();
+                Some(stanza::disco::DiscoItemsResponse::new(id, to, node, items).to_xml())
+            }
+            // A query in some other namespace is not service discovery.
+            _ => None,
+        };
+    }
+
+    return None;
 }
 
 async fn process_presence_error(
@@ -631,6 +706,21 @@ mod tests
         assert_eq!(id.as_deref(), Some("ping_1"));
     }
 
+    /// Build a [`SharedWriter`] backed by a real loopback socket, returning the
+    /// server end so a test can read back whatever the client task writes.
+    async fn loopback_writer() -> (SharedWriter, tokio::net::TcpStream)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (accepted, connected) = tokio::join!(listener.accept(), tokio::net::TcpStream::connect(addr));
+        let server = accepted.unwrap().0;
+        let (_reader, write_half) = tokio::io::split(connected.unwrap());
+        let writer = std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::tcp_stream::TcpWriter::Plain(write_half),
+        ));
+        return (writer, server);
+    }
+
     #[tokio::test]
     async fn iq_result_wakes_pending_caller()
     {
@@ -643,6 +733,9 @@ mod tests
         let (tx, rx) = tokio::sync::oneshot::channel();
         pending_iqs.lock().unwrap().insert("ping_1".to_string(), tx);
 
+        let (writer, _server) = loopback_writer().await;
+        let local_disco: LocalDiscoState = std::sync::Arc::new(std::sync::Mutex::new(crate::LocalDisco::default()));
+
         process_stanza(
             "<iq type='result' id='ping_1'/>",
             &event_tx,
@@ -650,9 +743,114 @@ mod tests
             &mut pending_messages,
             &mut joined_rooms,
             &pending_iqs,
+            &writer,
+            &local_disco,
         ).await;
 
-        assert!(rx.await.is_ok());
+        // The caller receives the raw reply stanza so it can parse any payload.
+        assert_eq!(rx.await.unwrap(), "<iq type='result' id='ping_1'/>");
         assert!(pending_iqs.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disco_info_get_is_answered()
+    {
+        use tokio::io::AsyncReadExt;
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let mut pending_joins = HashMap::new();
+        let mut pending_messages = HashMap::new();
+        let mut joined_rooms = HashSet::new();
+        let pending_iqs: PendingIqs = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let (writer, mut server) = loopback_writer().await;
+        let local_disco: LocalDiscoState = std::sync::Arc::new(std::sync::Mutex::new(crate::LocalDisco::default()));
+
+        process_stanza(
+            "<iq type='get' from='asker@example.com/x' id='q1'>\
+             <query xmlns='http://jabber.org/protocol/disco#info'/></iq>",
+            &event_tx,
+            &mut pending_joins,
+            &mut pending_messages,
+            &mut joined_rooms,
+            &pending_iqs,
+            &writer,
+            &local_disco,
+        ).await;
+
+        let mut buf = vec![0u8; 4096];
+        let n = server.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+
+        assert!(response.contains("type='result'"), "got: {}", response);
+        assert!(response.contains("to='asker@example.com/x'"), "got: {}", response);
+        assert!(response.contains("id='q1'"), "got: {}", response);
+        assert!(response.contains("<identity category='client' type='bot'"), "got: {}", response);
+        assert!(response.contains("<feature var='http://jabber.org/protocol/disco#info'/>"), "got: {}", response);
+    }
+
+    #[tokio::test]
+    async fn ping_get_is_answered_with_pong()
+    {
+        use tokio::io::AsyncReadExt;
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let mut pending_joins = HashMap::new();
+        let mut pending_messages = HashMap::new();
+        let mut joined_rooms = HashSet::new();
+        let pending_iqs: PendingIqs = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let (writer, mut server) = loopback_writer().await;
+        let local_disco: LocalDiscoState = std::sync::Arc::new(std::sync::Mutex::new(crate::LocalDisco::default()));
+
+        process_stanza(
+            "<iq type='get' from='peer@example.com/x' id='p1'><ping xmlns='urn:xmpp:ping'/></iq>",
+            &event_tx,
+            &mut pending_joins,
+            &mut pending_messages,
+            &mut joined_rooms,
+            &pending_iqs,
+            &writer,
+            &local_disco,
+        ).await;
+
+        let mut buf = vec![0u8; 4096];
+        let n = server.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+
+        assert_eq!(response, "<iq type='result' to='peer@example.com/x' id='p1'/>");
+    }
+
+    #[tokio::test]
+    async fn unhandled_get_is_ignored()
+    {
+        use tokio::io::AsyncReadExt;
+
+        let (event_tx, _event_rx) = mpsc::channel(8);
+        let mut pending_joins = HashMap::new();
+        let mut pending_messages = HashMap::new();
+        let mut joined_rooms = HashSet::new();
+        let pending_iqs: PendingIqs = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        let (writer, mut server) = loopback_writer().await;
+        let local_disco: LocalDiscoState = std::sync::Arc::new(std::sync::Mutex::new(crate::LocalDisco::default()));
+
+        // A roster query is a get we do not answer here; nothing should be
+        // written back.
+        process_stanza(
+            "<iq type='get' from='asker@example.com' id='r1'><query xmlns='jabber:iq:roster'/></iq>",
+            &event_tx,
+            &mut pending_joins,
+            &mut pending_messages,
+            &mut joined_rooms,
+            &pending_iqs,
+            &writer,
+            &local_disco,
+        ).await;
+
+        // No reply is sent, so a short read times out instead of returning data.
+        let mut buf = vec![0u8; 64];
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), server.read(&mut buf)).await;
+        assert!(result.is_err(), "expected no response, but socket had data");
     }
 }

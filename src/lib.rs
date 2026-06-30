@@ -3,8 +3,11 @@
 //! It currently supports connecting to an XMPP server with STARTTLS and
 //! SASL authentication, joining and leaving Multi-User Chat (MUC) rooms,
 //! sending and receiving group messages, exchanging one-to-one chat
-//! messages, and sending XEP-0199 pings to keep the connection alive or
-//! probe whether it is still usable. Server events are delivered as
+//! messages, sending XEP-0199 pings to keep the connection alive or
+//! probe whether it is still usable (and answering pings from others),
+//! and performing XEP-0030 service discovery to learn the identities,
+//! features, and hosted items of remote entities as well as answering
+//! such queries from others. Server events are delivered as
 //! [`XmppEvent`] values on an [`mpsc::Receiver`] returned from
 //! [`XmppClient::new`].
 //!
@@ -61,11 +64,14 @@ use xml_framer::XmlFramer;
 /// Registry of in-flight IQ requests awaiting a reply, keyed by stanza `id`.
 ///
 /// A caller (e.g. [`XmppClient::ping`]) inserts a [`oneshot::Sender`] before
-/// sending its request; the background reader task removes and fires it when
-/// the matching `<iq type='result'>` or `<iq type='error'>` arrives. The lock
-/// is only ever held for the brief, non-async insert/remove, so a
-/// [`std::sync::Mutex`] is sufficient.
-pub(crate) type PendingIqs = Arc<Mutex<HashMap<String, oneshot::Sender<()>>>>;
+/// sending its request; the background reader task removes and fires it,
+/// handing over the raw reply stanza XML, when the matching
+/// `<iq type='result'>` or `<iq type='error'>` arrives. Callers that only need
+/// to know a reply came (e.g. ping) ignore the payload; those that need the
+/// response body (e.g. service discovery) parse it. The lock is only ever held
+/// for the brief, non-async insert/remove, so a [`std::sync::Mutex`] is
+/// sufficient.
+pub(crate) type PendingIqs = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>;
 
 /// An event emitted by an [`XmppClient`] over its event channel.
 ///
@@ -135,6 +141,116 @@ pub struct RoomMember
     pub status: Option<String>,
 }
 
+/// An identity advertised by an entity in reply to a service discovery info
+/// query, as defined by [XEP-0030](https://xmpp.org/extensions/xep-0030.html).
+///
+/// For example, a conference service typically reports category `conference`
+/// with type `text`; a server reports category `server` with type `im`.
+#[derive(Debug, Clone)]
+pub struct DiscoIdentity
+{
+    /// The identity category (e.g. `server`, `conference`, `client`).
+    pub category: String,
+    /// The identity type within the category.
+    pub kind: String,
+    /// An optional human-readable name for the identity.
+    pub name: Option<String>,
+}
+
+/// The result of a service discovery info query: the identities and feature
+/// namespaces an entity advertises.
+#[derive(Debug, Clone)]
+pub struct DiscoInfo
+{
+    /// The identities reported by the entity.
+    pub identities: Vec<DiscoIdentity>,
+    /// The feature namespaces (`var` values) the entity supports, e.g.
+    /// `urn:xmpp:ping` or `http://jabber.org/protocol/muc`.
+    pub features: Vec<String>,
+}
+
+impl DiscoInfo
+{
+    /// Returns `true` if the entity advertised the given feature namespace.
+    pub fn has_feature(&self, var: &str) -> bool
+    {
+        return self.features.iter().any(|f| f == var);
+    }
+}
+
+/// An item hosted by an entity, as returned by a service discovery items
+/// query (e.g. a chat room on a conference service).
+#[derive(Debug, Clone)]
+pub struct DiscoItem
+{
+    /// The JID of the item.
+    pub jid: String,
+    /// An optional human-readable name for the item.
+    pub name: Option<String>,
+    /// An optional node, used when the item is a node of `jid` rather than a
+    /// distinct entity.
+    pub node: Option<String>,
+}
+
+/// Build the error returned when a service discovery query is answered with an
+/// IQ error (or any reply lacking the expected `<query>` payload).
+fn iq_error(query: &str, iq_type: &str) -> XmppError
+{
+    return XmppError::Protocol(format!("{} query returned iq type '{}'", query, iq_type));
+}
+
+/// The identities, features, and items this client advertises when answering
+/// incoming XEP-0030 service discovery queries from other entities.
+///
+/// Held behind a [`Mutex`] so it can be reconfigured at runtime (e.g. with
+/// [`XmppClient::set_disco_info`]) while the background reader task reads it to
+/// build replies.
+#[derive(Debug, Clone)]
+pub(crate) struct LocalDisco
+{
+    pub(crate) info: DiscoInfo,
+    pub(crate) items: Vec<DiscoItem>,
+}
+
+impl Default for LocalDisco
+{
+    fn default() -> Self
+    {
+        // Advertise the one identity and the features we actually answer here:
+        // the two service-discovery namespaces and XEP-0199 ping. Callers can
+        // replace these via the `set_disco_*` methods on [`XmppClient`].
+        return LocalDisco
+        {
+            info: DiscoInfo
+            {
+                identities: vec![DiscoIdentity
+                {
+                    category: "client".to_string(),
+                    // Default kind to bot. Should be set to a better value
+                    // by the calling client by setting a new [`DiscoInfo`].
+                    kind: "bot".to_string(),
+                    name: Some("libxmpp".to_string()),
+                }],
+                features: vec![
+                    "http://jabber.org/protocol/disco#info".to_string(),
+                    "http://jabber.org/protocol/disco#items".to_string(),
+                    "urn:xmpp:ping".to_string(),
+                ],
+            },
+            items: Vec::new(),
+        };
+    }
+}
+
+/// Shared handle to the [`LocalDisco`] advertised by a client. Cloned into the
+/// background reader task so it can answer incoming queries.
+pub(crate) type LocalDiscoState = Arc<Mutex<LocalDisco>>;
+
+/// Shared handle to the connection's write half. Both the public client methods
+/// and the background reader task (when auto-replying to incoming IQs) send
+/// through it, so it is guarded by an async [`tokio::sync::Mutex`].
+pub(crate) type SharedWriter = Arc<tokio::sync::Mutex<tcp_stream::TcpWriter>>;
+
 /// An asynchronous XMPP client.
 ///
 /// An `XmppClient` owns the TCP/TLS connection, the background reader
@@ -146,10 +262,11 @@ pub struct XmppClient
 {
     shutdown: Arc<Notify>,
     task: JoinHandle<()>,
-    writer: tcp_stream::TcpWriter,
+    writer: SharedWriter,
     bound_jid: String,
     pending_iqs: PendingIqs,
-    next_ping_id: u64,
+    next_iq_id: u64,
+    local_disco: LocalDiscoState,
 }
 
 impl XmppClient
@@ -187,12 +304,22 @@ impl XmppClient
         // Broadcast initial available presence so the server routes
         // incoming directed messages (e.g. one-to-one chats) to this resource.
         writer.write(b"<presence/>").await?;
+
+        // Share the write half with the reader task so it can auto-reply to
+        // incoming IQ queries (e.g. service discovery) without round-tripping
+        // through the owning client.
+        let writer: SharedWriter = Arc::new(tokio::sync::Mutex::new(writer));
+        let writer_loop = writer.clone();
+
         let shutdown = Arc::new(Notify::new());
         let shutdown_clone = shutdown.clone();
         let event_tx_loop = event_tx.clone();
 
         let pending_iqs: PendingIqs = Arc::new(Mutex::new(HashMap::new()));
         let pending_iqs_loop = pending_iqs.clone();
+
+        let local_disco: LocalDiscoState = Arc::new(Mutex::new(LocalDisco::default()));
+        let local_disco_loop = local_disco.clone();
 
         let task = tokio::spawn(async move
         {
@@ -207,7 +334,7 @@ impl XmppClient
                 while let Some(stanza_xml) = framer.try_next()
                 {
                     log::debug!("Received stanza: {}", stanza_xml);
-                    xmpp::process_stanza(&stanza_xml, &event_tx_loop, &mut pending_joins, &mut pending_messages, &mut joined_rooms, &pending_iqs_loop).await;
+                    xmpp::process_stanza(&stanza_xml, &event_tx_loop, &mut pending_joins, &mut pending_messages, &mut joined_rooms, &pending_iqs_loop, &writer_loop, &local_disco_loop).await;
                 }
 
                 // Collect data.
@@ -238,7 +365,7 @@ impl XmppClient
 
         let _ = event_tx.send(XmppEvent::Connected).await;
 
-        return Ok((Self { shutdown, task, writer, bound_jid, pending_iqs, next_ping_id: 0 }, event_rx));
+        return Ok((Self { shutdown, task, writer, bound_jid, pending_iqs, next_iq_id: 0, local_disco }, event_rx));
     }
 
     /// Return the full JID assigned to this session by the server,
@@ -258,7 +385,7 @@ impl XmppClient
     pub async fn join_room(&mut self, room_jid: &str, nick: &str) -> Result<(), XmppError>
     {
         let presence = stanza::muc::MucJoinPresence::new(room_jid.to_string(), nick.to_string());
-        return self.writer.write(&presence.as_bytes()).await;
+        return self.writer.lock().await.write(&presence.as_bytes()).await;
     }
 
     /// Leave a MUC room previously joined as `nick`.
@@ -268,7 +395,7 @@ impl XmppClient
     pub async fn leave_room(&mut self, room_jid: &str, nick: &str) -> Result<(), XmppError>
     {
         let presence = stanza::muc::MucLeavePresence::new(room_jid.to_string(), nick.to_string());
-        return self.writer.write(&presence.as_bytes()).await;
+        return self.writer.lock().await.write(&presence.as_bytes()).await;
     }
 
     /// Send a group chat message to a MUC room.
@@ -278,7 +405,7 @@ impl XmppClient
     pub async fn send_room_message(&mut self, room_jid: &str, body: &str) -> Result<(), XmppError>
     {
         let msg = stanza::muc::MucGroupMessage::new(room_jid.to_string(), body.to_string());
-        return self.writer.write(&msg.as_bytes()).await;
+        return self.writer.lock().await.write(&msg.as_bytes()).await;
     }
 
     /// Send a one-to-one chat message.
@@ -288,7 +415,7 @@ impl XmppClient
     pub async fn send_message(&mut self, to: &str, body: &str) -> Result<(), XmppError>
     {
         let msg = stanza::chat::ChatMessage::new(to.to_string(), body.to_string());
-        return self.writer.write(&msg.as_bytes()).await;
+        return self.writer.lock().await.write(&msg.as_bytes()).await;
     }
 
     /// Send an [XEP-0199](https://xmpp.org/extensions/xep-0199.html) ping and
@@ -305,32 +432,175 @@ impl XmppClient
     /// [`XmppError::Disconnected`] if the connection drops while waiting.
     pub async fn ping(&mut self, to: Option<&str>, timeout: Duration) -> Result<Duration, XmppError>
     {
-        self.next_ping_id += 1;
-        let id = format!("ping_{}", self.next_ping_id);
-
-        let (tx, rx) = oneshot::channel();
-        self.pending_iqs.lock().unwrap().insert(id.clone(), tx);
-
+        let id = self.next_iq_id("ping");
         let request = stanza::ping::PingRequest::new(id.clone(), to.map(|s| s.to_string()));
-        let start = std::time::Instant::now();
 
-        if let Err(e) = self.writer.write(&request.as_bytes()).await
+        let start = std::time::Instant::now();
+        // Any reply (result or error) proves the peer is reachable; the body is
+        // irrelevant for a ping, so the reply XML is discarded.
+        self.request_iq(&id, &request, timeout).await?;
+        return Ok(start.elapsed());
+    }
+
+    /// Send an [XEP-0030](https://xmpp.org/extensions/xep-0030.html) service
+    /// discovery **info** query and wait for the reply.
+    ///
+    /// The reply describes the target entity: the [`DiscoIdentity`] values it
+    /// advertises and the feature namespaces it supports. When `to` is `None`
+    /// the query targets the user's own server. Pass `Some(node)` to scope the
+    /// query to a particular node of the entity (e.g. an ad-hoc command);
+    /// otherwise pass `None`.
+    ///
+    /// Returns [`XmppError::Protocol`] if the entity answers with an IQ error
+    /// (e.g. it does not support service discovery), [`XmppError::Timeout`] if
+    /// no reply arrives within `timeout`, or [`XmppError::Disconnected`] if the
+    /// connection drops while waiting.
+    pub async fn disco_info(&mut self, to: Option<&str>, node: Option<&str>, timeout: Duration) -> Result<DiscoInfo, XmppError>
+    {
+        let id = self.next_iq_id("disco");
+        let request = stanza::disco::DiscoInfoRequest::new(
+            id.clone(),
+            to.map(|s| s.to_string()),
+            node.map(|s| s.to_string()),
+        );
+
+        let reply = self.request_iq(&id, &request, timeout).await?;
+        let result = stanza::disco::DiscoInfoResult::from_xml(&reply).map_err(XmppError::Parse)?;
+
+        // An error reply commonly echoes an empty `<query/>`, so detect failure
+        // from the iq type rather than the presence of the query payload.
+        if result.iq_type == "error"
         {
-            self.pending_iqs.lock().unwrap().remove(&id);
+            return Err(iq_error("disco#info", &result.iq_type));
+        }
+        let query = result.query.ok_or_else(|| iq_error("disco#info", &result.iq_type))?;
+
+        let identities = query.identities.into_iter().map(|i| DiscoIdentity
+        {
+            category: i.category,
+            kind: i.kind,
+            name: i.name,
+        }).collect();
+        let features = query.features.into_iter().map(|f| f.var).collect();
+
+        return Ok(DiscoInfo { identities, features });
+    }
+
+    /// Send an [XEP-0030](https://xmpp.org/extensions/xep-0030.html) service
+    /// discovery **items** query and wait for the reply.
+    ///
+    /// The reply lists the [`DiscoItem`]s hosted by the target entity, such as
+    /// the rooms on a conference service. When `to` is `None` the query targets
+    /// the user's own server. Pass `Some(node)` to scope the query to a
+    /// particular node; otherwise pass `None`.
+    ///
+    /// Returns [`XmppError::Protocol`] if the entity answers with an IQ error,
+    /// [`XmppError::Timeout`] if no reply arrives within `timeout`, or
+    /// [`XmppError::Disconnected`] if the connection drops while waiting.
+    pub async fn disco_items(&mut self, to: Option<&str>, node: Option<&str>, timeout: Duration) -> Result<Vec<DiscoItem>, XmppError>
+    {
+        let id = self.next_iq_id("disco");
+        let request = stanza::disco::DiscoItemsRequest::new(
+            id.clone(),
+            to.map(|s| s.to_string()),
+            node.map(|s| s.to_string()),
+        );
+
+        let reply = self.request_iq(&id, &request, timeout).await?;
+        let result = stanza::disco::DiscoItemsResult::from_xml(&reply).map_err(XmppError::Parse)?;
+
+        // An error reply commonly echoes an empty `<query/>`, so detect failure
+        // from the iq type rather than the presence of the query payload.
+        if result.iq_type == "error"
+        {
+            return Err(iq_error("disco#items", &result.iq_type));
+        }
+        let query = result.query.ok_or_else(|| iq_error("disco#items", &result.iq_type))?;
+
+        let items = query.items.into_iter().map(|i| DiscoItem
+        {
+            jid: i.jid,
+            name: i.name,
+            node: i.node,
+        }).collect();
+
+        return Ok(items);
+    }
+
+    /// Replace the identities and features this client advertises when it
+    /// answers an incoming [XEP-0030](https://xmpp.org/extensions/xep-0030.html)
+    /// service discovery **info** query.
+    ///
+    /// By default a client advertises a single `client`/`bot` identity named
+    /// `libxmpp` and the two service-discovery features it answers. Call this to
+    /// present a different identity or to advertise additional features the
+    /// surrounding application supports (using [`add_disco_feature`] for the
+    /// latter is usually more convenient). Takes effect for queries received
+    /// after it returns.
+    ///
+    /// [`add_disco_feature`]: Self::add_disco_feature
+    pub fn set_disco_info(&self, info: DiscoInfo)
+    {
+        self.local_disco.lock().unwrap().info = info;
+    }
+
+    /// Advertise an additional feature namespace (e.g.
+    /// `http://jabber.org/protocol/muc`) in replies to service discovery info
+    /// queries. A namespace already advertised is not added again.
+    pub fn add_disco_feature(&self, var: &str)
+    {
+        let mut disco = self.local_disco.lock().unwrap();
+        if !disco.info.features.iter().any(|f| f == var)
+        {
+            disco.info.features.push(var.to_string());
+        }
+    }
+
+    /// Replace the items this client advertises when it answers an incoming
+    /// service discovery **items** query.
+    ///
+    /// A plain client hosts nothing and so advertises an empty list by default.
+    pub fn set_disco_items(&self, items: Vec<DiscoItem>)
+    {
+        self.local_disco.lock().unwrap().items = items;
+    }
+
+    /// Allocate the next unique IQ stanza `id`, tagged with `prefix` so it is
+    /// recognisable in logs (e.g. `ping_3`, `disco_7`).
+    fn next_iq_id(&mut self, prefix: &str) -> String
+    {
+        self.next_iq_id += 1;
+        return format!("{}_{}", prefix, self.next_iq_id);
+    }
+
+    /// Send an IQ `request` already carrying stanza `id`, then wait for the
+    /// matching reply and return its raw XML.
+    ///
+    /// The pending-reply entry is registered before the request is written so
+    /// the reader task can never deliver the reply before this call is ready
+    /// for it, and is removed again if the write fails or the wait times out.
+    async fn request_iq(&mut self, id: &str, request: &dyn Stanza, timeout: Duration) -> Result<String, XmppError>
+    {
+        let (tx, rx) = oneshot::channel();
+        self.pending_iqs.lock().unwrap().insert(id.to_string(), tx);
+
+        if let Err(e) = self.writer.lock().await.write(&request.as_bytes()).await
+        {
+            self.pending_iqs.lock().unwrap().remove(id);
             return Err(e);
         }
 
         match tokio::time::timeout(timeout, rx).await
         {
-            // Reply arrived (result or error); the connection is alive.
-            Ok(Ok(())) => return Ok(start.elapsed()),
+            // Reply arrived (result or error); hand back its XML.
+            Ok(Ok(reply)) => return Ok(reply),
             // Sender dropped: the reader task ended, so the connection is gone.
             Ok(Err(_)) => return Err(XmppError::Disconnected),
             // No reply within the deadline; drop the pending entry.
             Err(_) =>
             {
-                self.pending_iqs.lock().unwrap().remove(&id);
-                return Err(XmppError::Timeout(format!("no ping reply for id {}", id)));
+                self.pending_iqs.lock().unwrap().remove(id);
+                return Err(XmppError::Timeout(format!("no reply for iq id {}", id)));
             }
         }
     }
@@ -344,6 +614,6 @@ impl XmppClient
     {
         self.shutdown.notify_one();
         let _ = self.task.await;
-        self.writer.shutdown().await;
+        self.writer.lock().await.shutdown().await;
     }
 }
